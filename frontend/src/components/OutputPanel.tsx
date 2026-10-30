@@ -57,19 +57,26 @@ function Collapsible({
 
 export function OutputPanel() {
   const { result, error, rateLimitInfo, solving, language, problem, setExplanationText, setShowExplanation } = useSolveStore()
+  const [explaining, setExplaining] = useState(false)
 
   const requestExplanation = async () => {
-    if (!problem.trim()) return
+    if (!problem.trim() || !result?.final_solution || explaining) return
+    setExplaining(true)
     try {
       toast('Generating explanation...', { icon: '📚' })
-      const res = await api.solveText(
-        problem + '\n\nProvide a detailed beginner-friendly explanation of the algorithm and each step.',
-        language
+      const res = await api.explain(
+        problem,
+        result.final_solution,
+        language,
+        result.chosen_approach,
+        result.reasoning_chain,
       )
-      setExplanationText(res.reasoning_chain || res.final_solution || '')
+      setExplanationText(res.explanation)
       setShowExplanation(true)
     } catch {
       toast.error('Could not generate explanation.')
+    } finally {
+      setExplaining(false)
     }
   }
 
@@ -194,8 +201,8 @@ export function OutputPanel() {
           <div className="card-header">
             <div className="card-title">💻 {language.toUpperCase()} SOLUTION</div>
             <div className="flex gap-2">
-              <button onClick={requestExplanation} className="btn text-[10px]">
-                💬 Explain
+              <button onClick={requestExplanation} className="btn text-[10px]" disabled={explaining}>
+                {explaining ? '⏳ Explaining...' : '💬 Explain'}
               </button>
               <CopyButton text={result.final_solution} />
             </div>

@@ -44,6 +44,11 @@ export interface SolveResult {
   pipeline_events:      PipelineEvent[]
 }
 
+export interface ExplanationResponse {
+  explanation: string
+  cached: boolean
+}
+
 export interface PipelineEvent {
   agent:     AgentRole | 'judge0'
   status:    string

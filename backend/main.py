@@ -26,6 +26,8 @@ from utils.ai_router import (
     get_ai_config_summary,
     reset_usage_stats,
     RateLimitHit,
+    call_ai,
+    AIProviderError,
 )
 from agents.all_agents import AgentFailure
 from memory.brain import (
@@ -195,6 +197,36 @@ class SolveRequest(BaseModel):
             raise ValueError(f"language must be one of: {allowed}")
         return v
 
+
+class ExplainRequest(BaseModel):
+    problem: str
+    final_code: str
+    chosen_approach: str = ""
+    reasoning_chain: str = ""
+    language: str = "python"
+
+    @field_validator("language")
+    @classmethod
+    def validate_explain_language(cls, v: str) -> str:
+        if v not in {"python", "cpp", "java"}:
+            raise ValueError("language must be python, cpp, or java")
+        return v
+
+    @field_validator("problem", "final_code", "chosen_approach", "reasoning_chain")
+    @classmethod
+    def validate_explain_text(cls, v: str) -> str:
+        if not isinstance(v, str):
+            raise ValueError("explanation fields must be strings")
+        return v
+
+
+_EXPLANATION_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _explanation_cache_key(user_id: str, req: ExplainRequest) -> tuple[str, str]:
+    material = f"{req.language}\0{req.problem}\0{req.final_code}".encode("utf-8")
+    return user_id, hashlib.sha256(material).hexdigest()
+
     @field_validator("problem")
     @classmethod
     def validate_problem(cls, v: str) -> str:
@@ -276,6 +308,63 @@ async def solve_text(request: Request, req: SolveRequest, user_id: str = Depends
     except Exception as e:
         log.error("solve_error", error=str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/explain")
+@limiter.limit(settings.solve_rate_limit)
+async def explain_solution(
+    request: Request,
+    req: ExplainRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Explain an existing result with one Strategist call, without rebuilding the graph."""
+    total_chars = sum(len(value) for value in (
+        req.problem, req.final_code, req.chosen_approach, req.reasoning_chain,
+    ))
+    if total_chars > 50_000:
+        raise HTTPException(status_code=422, detail="Explanation input too long (max 50,000 chars).")
+
+    cache_key = _explanation_cache_key(user_id, req)
+    if cache_key in _EXPLANATION_CACHE:
+        return {"explanation": _EXPLANATION_CACHE[cache_key], "cached": True}
+
+    try:
+        explanation, _ = await call_ai(
+            role="strategist",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Explain the supplied competitive-programming solution plainly. "
+                        "Use the chosen approach and reasoning as context, but do not rewrite code. "
+                        "Return only a clear plain-text explanation with algorithm steps, correctness intuition, "
+                        "complexity, and a short walkthrough."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Language: {req.language}\nProblem:\n{req.problem}\n\n"
+                        f"Chosen approach:\n{req.chosen_approach}\n\n"
+                        f"Reasoning chain:\n{req.reasoning_chain}\n\n"
+                        f"Final code:\n{req.final_code}"
+                    ),
+                },
+            ],
+        )
+    except RateLimitHit as e:
+        _handle_rate_limit(e)
+    except (AIProviderError, ValueError) as e:
+        log.error("explain_ai_error", error=str(e))
+        raise HTTPException(status_code=502, detail="AI provider failure.")
+    except Exception as e:
+        log.error("explain_error", error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    if not explanation or not explanation.strip():
+        raise HTTPException(status_code=502, detail="AI provider returned an empty explanation.")
+    _EXPLANATION_CACHE[cache_key] = explanation.strip()
+    return {"explanation": _EXPLANATION_CACHE[cache_key], "cached": False}
 
 
 @app.post("/solve-image")

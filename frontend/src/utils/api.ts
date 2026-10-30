@@ -1,6 +1,6 @@
 import axios from 'axios'
 import type {
-  SolveResult, UsageStats, AiConfig,
+  SolveResult, UsageStats, AiConfig, ExplanationResponse,
   BrainStats, TemporalInsights, HealthStatus, Language,
 } from '@/types'
 
@@ -72,6 +72,22 @@ export const api = {
     fd.append('extra_text', extraText)
     fd.append('manual_ai_overrides', JSON.stringify(manualOverrides ?? {}))
     return client.post('/solve-image', fd).then((r) => r.data)
+  },
+
+  explain(
+    problem: string,
+    finalCode: string,
+    language: Language,
+    chosenApproach: string,
+    reasoningChain: string,
+  ): Promise<ExplanationResponse> {
+    return client.post('/explain', {
+      problem,
+      final_code: finalCode,
+      language,
+      chosen_approach: chosenApproach,
+      reasoning_chain: reasoningChain,
+    }).then((r) => r.data)
   },
 
   getUsage(): Promise<UsageStats> {
