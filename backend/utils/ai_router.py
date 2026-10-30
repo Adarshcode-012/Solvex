@@ -107,12 +107,12 @@ def get_agent_model(
     )
 
 
-def _build_vision_message(content_text: str, image_base64: str, ai_key: str) -> dict:
+def _build_vision_message(content_text: str, image_base64: str, ai_key: str, image_mime_type: str) -> dict:
     """
     Builds the correct vision message format per provider.
     Gemini and OpenAI/Anthropic use different image_url structures via LiteLLM.
     """
-    image_url = f"data:image/png;base64,{image_base64}"
+    image_url = f"data:{image_mime_type};base64,{image_base64}"
 
     # All providers use the same LiteLLM image_url format
     return {
@@ -137,6 +137,7 @@ async def call_ai(
     max_tokens: int = 4096,
     temperature: float = 0.1,
     image_base64: Optional[str] = None,
+    image_mime_type: str = "image/png",
 ) -> tuple[str, str]:
     """
     Routes an AI call through LiteLLM with retry, usage tracking, and error handling.
@@ -154,7 +155,7 @@ async def call_ai(
         last_idx = len(messages) - 1
         last = messages[last_idx]
         if isinstance(last.get("content"), str):
-            messages[last_idx] = _build_vision_message(last["content"], image_base64, ai_key)
+            messages[last_idx] = _build_vision_message(last["content"], image_base64, ai_key, image_mime_type)
 
     log.info("ai_call", role=role, ai=ai_key, model=model)
 

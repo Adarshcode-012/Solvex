@@ -12,11 +12,13 @@ from pydantic_settings import BaseSettings
 from pydantic import Field, model_validator
 from typing import Optional
 import os
+from urllib.parse import urlparse
 
 
 class Settings(BaseSettings):
-    # ── App auth (protects mutating / expensive endpoints) ─────────────────────
+    # ── Guest session signing ──────────────────────────────────────────────────
     app_secret_key: Optional[str] = Field(None, validation_alias="APP_SECRET_KEY")
+    guest_session_secret: Optional[str] = Field(None, validation_alias="GUEST_SESSION_SECRET")
 
     # ── AI API Keys (all optional — at least one required) ─────────────────────
     anthropic_api_key: Optional[str] = Field(None, validation_alias="ANTHROPIC_API_KEY")
@@ -46,7 +48,7 @@ class Settings(BaseSettings):
     # ── App ────────────────────────────────────────────────────────────────────
     judge_max_iterations: int  = Field(5,     validation_alias="JUDGE_MAX_ITERATIONS")
     log_level:            str  = Field("INFO", validation_alias="LOG_LEVEL")
-    cors_origins:         str  = Field("*",    validation_alias="CORS_ORIGINS")
+    cors_origins:         str  = Field("http://localhost:5173", validation_alias="CORS_ORIGINS")
     app_env:              str  = Field("development", validation_alias="APP_ENV")
 
     @model_validator(mode="after")
@@ -59,7 +61,7 @@ class Settings(BaseSettings):
         ])
         if not has_key:
             raise ValueError(
-                "\n\n❌ SolveX requires at least one AI API key.\n"
+                "\n\n SolveX requires at least one AI API key.\n"
                 "Add one of these to your .env file:\n"
                 "  ANTHROPIC_API_KEY=sk-ant-...\n"
                 "  OPENAI_API_KEY=sk-...\n"
@@ -78,17 +80,15 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [o.strip() for o in self.cors_origins.split(",")]
+        return [origin.strip() for origin in self.cors_origins.split(",")]
 
     @model_validator(mode="after")
     def warn_if_unprotected_in_prod(self) -> "Settings":
-        """Fail fast if deploying to production with no API key gate — avoids
-        accidentally exposing paid AI endpoints to the whole internet."""
-        if self.app_env == "production" and not self.app_secret_key:
+        """Fail fast if production cannot sign guest sessions."""
+        if self.app_env == "production" and not (self.app_secret_key or self.guest_session_secret):
             raise ValueError(
-                "\n\n❌ APP_ENV=production but APP_SECRET_KEY is not set.\n"
-                "Every /solve call spends real money on AI providers — set:\n"
-                "  APP_SECRET_KEY=<a long random string>\n"
+                "\n\n APP_ENV=production but no guest session secret is set.\n"
+                "Set GUEST_SESSION_SECRET or APP_SECRET_KEY to a long random string.\n"
                 "in your .env before deploying, or the app will refuse to start.\n"
             )
         return self
@@ -98,13 +98,30 @@ class Settings(BaseSettings):
         """Fail fast if deploying to production with CORS still wide open —
         the same reasoning as the secret-key guard above: this is the kind
         of thing that's trivial to forget when copying .env.example → .env."""
-        if self.app_env == "production" and self.cors_origins.strip() == "*":
+        origins = self.cors_origins_list
+        if self.app_env == "production" and (
+            not origins
+            or any(
+                origin == "*"
+                or not origin
+                or urlparse(origin).scheme != "https"
+                or not urlparse(origin).netloc
+                for origin in origins
+            )
+        ):
             raise ValueError(
-                "\n\n❌ APP_ENV=production but CORS_ORIGINS is still \"*\".\n"
-                "Set it to your real frontend domain(s), comma-separated, e.g.:\n"
+                "\n\n APP_ENV=production has invalid CORS_ORIGINS.\n"
+                "Use one or more https:// origins, comma-separated; wildcard is forbidden.\n"
                 "  CORS_ORIGINS=https://your-frontend-domain.com\n"
                 "in your .env before deploying, or the app will refuse to start.\n"
             )
+        if self.app_env == "development":
+            for origin in origins:
+                parsed = urlparse(origin)
+                if origin != "*" and (
+                    parsed.scheme not in {"http", "https"} or not parsed.netloc
+                ):
+                    raise ValueError("Development CORS origins must be valid http(s) origins or '*'.")
         return self
 
     model_config = {

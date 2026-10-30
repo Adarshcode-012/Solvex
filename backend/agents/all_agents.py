@@ -102,7 +102,7 @@ async def run_analyzer(state: dict) -> dict:
     log.info("agent_start", agent="analyzer")
     state.setdefault("pipeline_events", []).append({"agent": "analyzer", "status": "started"})
 
-    procedure = get_procedure("analyzer")
+    procedure = get_procedure("analyzer", state["user_id"])
 
     system = f"""You are the Analyzer Agent in a competitive programming solver.
 Your ONLY job: read and understand the problem, return structured JSON.
@@ -139,6 +139,7 @@ Return ONLY valid JSON — no text outside it:
             messages=messages,
             manual_overrides=state.get("manual_ai_overrides"),
             image_base64=state.get("image_base64"),
+            image_mime_type=state.get("image_mime_type", "image/png"),
         )
     except RateLimitHit:
         raise
@@ -176,10 +177,10 @@ async def run_strategist(state: dict) -> dict:
     log.info("agent_start", agent="strategist")
     state["pipeline_events"].append({"agent": "strategist", "status": "started"})
 
-    procedure = get_procedure("strategist")
-    similar   = recall_similar_problems(state["extracted_problem"])
+    procedure = get_procedure("strategist", state["user_id"])
+    similar   = recall_similar_problems(state["extracted_problem"], state["user_id"])
     insights  = recall_semantic_insights(
-        f"{state['dsa_category']} {state['constraints'].get('n_max', '')}"
+        f"{state['dsa_category']} {state['constraints'].get('n_max', '')}", state["user_id"]
     )
 
     memory_ctx = ""
@@ -269,6 +270,7 @@ Sample Output: {state['sample_outputs'][:2]}
             pattern=f"{state['dsa_category']} N={state['constraints'].get('n_max','')}",
             insight=new_pattern,
             category=state["dsa_category"],
+            user_id=state["user_id"],
         )
 
     log.info("agent_done", agent="strategist", approach=state["chosen_approach"],
@@ -313,7 +315,7 @@ async def run_coder(state: dict) -> dict:
     log.info("agent_start", agent="coder", iteration=iteration, language=language)
     state["pipeline_events"].append({"agent": "coder", "status": "started", "iteration": iteration})
 
-    procedure = get_procedure("coder")
+    procedure = get_procedure("coder", state["user_id"])
 
     system = f"""You are the Coder Agent in a competitive programming solver.
 Write WORKING, OPTIMIZED code from the algorithm description.
@@ -414,7 +416,7 @@ async def run_reviewer(state: dict) -> dict:
     log.info("agent_start", agent="reviewer")
     state["pipeline_events"].append({"agent": "reviewer", "status": "started"})
 
-    procedure = get_procedure("reviewer")
+    procedure = get_procedure("reviewer", state["user_id"])
 
     system = f"""You are the Reviewer Agent in a competitive programming solver.
 Review code for CORRECTNESS bugs only — not style or formatting.
@@ -622,6 +624,7 @@ async def run_judge(state: dict) -> dict:
     iteration = state.get("judge_iteration", 0)
     language  = state.get("language", "python")
     code      = state.get("generated_code", "")
+    user_id   = state.get("user_id", "guest_default")
 
     log.info("agent_start", agent="judge", iteration=iteration + 1,
              max=state["judge_max_iterations"])
@@ -726,7 +729,7 @@ async def run_judge(state: dict) -> dict:
             "approach":   state["chosen_approach"],
             "language":   language,
             "category":   state["dsa_category"],
-        })
+        }, user_id)
         state["pipeline_events"].append({"agent": "judge", "status": "passed"})
 
     else:
@@ -743,7 +746,7 @@ async def run_judge(state: dict) -> dict:
             record_temporal_event("solve_complete", {
                 "passed": False, "iterations": state["judge_iteration"],
                 "category": state["dsa_category"],
-            })
+            }, user_id)
             state["pipeline_events"].append({"agent": "judge", "status": "max_retries"})
 
         else:
@@ -751,7 +754,7 @@ async def run_judge(state: dict) -> dict:
             log.info("judge_failed", failure=ftype, retry=state["judge_iteration"])
 
             # Learn from mistake
-            auto_learn_from_mistake("reviewer", ftype)
+            auto_learn_from_mistake("reviewer", ftype, user_id)
 
             # Set precise error for Coder
             state["compile_error"]      = first_failure["msg"] if ftype == JUDGE_FAILED_COMPILE else ""

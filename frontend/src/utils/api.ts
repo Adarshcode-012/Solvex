@@ -8,17 +8,19 @@ import type {
 // In production: set VITE_API_URL env var
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
 
-// Must match the backend's APP_SECRET_KEY. Only needed if the backend has
-// one configured — set VITE_APP_API_KEY in the frontend's .env to match.
-// (This is a shared-secret header, not a substitute for real per-user auth —
-// fine for a solo-operator deployment; add proper auth if multiple people
-// will use this instance.)
-const API_KEY = import.meta.env.VITE_APP_API_KEY
-
 const client = axios.create({
   baseURL: BASE_URL,
   timeout: 180_000, // 3 min — agent pipeline can take 90s+
-  headers: API_KEY ? { 'X-API-Key': API_KEY } : {},
+  withCredentials: true,
+})
+
+client.interceptors.request.use((config) => {
+  const csrf = document.cookie
+    .split('; ')
+    .find((cookie) => cookie.startsWith('solvex_csrf='))
+    ?.split('=')[1]
+  if (csrf) config.headers['X-CSRF-Token'] = decodeURIComponent(csrf)
+  return config
 })
 
 // ── Response interceptor: unwrap Axios errors into plain messages ──────────────

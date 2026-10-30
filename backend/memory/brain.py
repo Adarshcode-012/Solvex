@@ -12,6 +12,7 @@ import os
 import json
 import time
 import tempfile
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -26,6 +27,19 @@ EPISODIC_FILE   = os.path.join(MEMORY_DIR, "episodic.json")
 SEMANTIC_FILE   = os.path.join(MEMORY_DIR, "semantic.json")
 PROCEDURAL_FILE = os.path.join(MEMORY_DIR, "procedural.json")
 TEMPORAL_FILE   = os.path.join(MEMORY_DIR, "temporal.json")
+
+
+def sanitize_user_id(user_id: str) -> str:
+    if not user_id or not re.fullmatch(r"[A-Za-z0-9_-]+", user_id):
+        raise ValueError("Invalid user id")
+    return user_id
+
+
+def _user_memory_file(user_id: str, filename: str) -> str:
+    safe_id = sanitize_user_id(user_id)
+    user_dir = os.path.join(MEMORY_DIR, safe_id)
+    os.makedirs(user_dir, exist_ok=True)
+    return os.path.join(user_dir, filename)
 
 # ── ChromaDB (local vector DB) ────────────────────────────────────────────────
 CHROMA_AVAILABLE = False
@@ -79,6 +93,20 @@ def reset_chroma_collections() -> dict[str, int]:
     return counts
 
 
+def reset_user_memory(user_id: str) -> dict[str, int]:
+    sanitize_user_id(user_id)
+    deleted = {"episodic": 0, "semantic": 0}
+    if CHROMA_AVAILABLE:
+        for key, collection in (("episodic", _episodic_col), ("semantic", _semantic_col)):
+            if collection is not None:
+                records = collection.get(where={"user_id": user_id})
+                ids = records.get("ids", [])
+                deleted[key] = len(ids)
+                if ids:
+                    collection.delete(ids=ids)
+    return deleted
+
+
 # ── Thread-safe JSON helpers ──────────────────────────────────────────────────
 def _load_json(path: str) -> dict:
     if os.path.exists(path):
@@ -111,7 +139,7 @@ def _save_json(path: str, data: dict) -> None:
 
 def store_episodic(
     problem: str, approach: str, language: str,
-    iterations: int, passed: bool, code_preview: str
+    iterations: int, passed: bool, code_preview: str, user_id: str
 ) -> None:
     entry = {
         "timestamp":    datetime.now().isoformat(),
@@ -127,7 +155,7 @@ def store_episodic(
         try:
             _episodic_col.add(
                 documents=[problem[:400]],
-                metadatas=[{k: str(v) if isinstance(v, bool) else v for k, v in entry.items()}],
+                metadatas=[{**{k: str(v) if isinstance(v, bool) else v for k, v in entry.items()}, "user_id": user_id}],
                 ids=[f"ep_{int(time.time() * 1000)}"]
             )
             log.info("episodic_stored", approach=approach, passed=passed)
@@ -136,13 +164,13 @@ def store_episodic(
             log.warning("episodic_chroma_fail", error=str(e))
 
     # JSON fallback
-    data    = _load_json(EPISODIC_FILE)
+    data    = _load_json(_user_memory_file(user_id, "episodic.json"))
     entries = data.get("entries", [])
     entries.append(entry)
-    _save_json(EPISODIC_FILE, {"entries": entries[-200:]})
+    _save_json(_user_memory_file(user_id, "episodic.json"), {"entries": entries[-200:]})
 
 
-def recall_similar_problems(current_problem: str, top_k: int = 3) -> list[dict]:
+def recall_similar_problems(current_problem: str, user_id: str, top_k: int = 3) -> list[dict]:
     if CHROMA_AVAILABLE and _episodic_col is not None:
         try:
             count = _episodic_col.count()
@@ -150,7 +178,8 @@ def recall_similar_problems(current_problem: str, top_k: int = 3) -> list[dict]:
                 return []
             results = _episodic_col.query(
                 query_texts=[current_problem[:400]],
-                n_results=min(top_k, count)
+                n_results=min(top_k, count),
+                where={"user_id": user_id},
             )
             metas = results.get("metadatas", [[]])[0]
             # Convert string booleans back
@@ -162,7 +191,7 @@ def recall_similar_problems(current_problem: str, top_k: int = 3) -> list[dict]:
             log.warning("episodic_recall_fail", error=str(e))
 
     # JSON fallback
-    data          = _load_json(EPISODIC_FILE)
+    data          = _load_json(_user_memory_file(user_id, "episodic.json"))
     entries       = data.get("entries", [])
     current_words = set(current_problem.lower().split())
     scored        = []
@@ -179,20 +208,21 @@ def recall_similar_problems(current_problem: str, top_k: int = 3) -> list[dict]:
 # LAYER 2 — SEMANTIC MEMORY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def store_semantic(pattern: str, insight: str, category: str) -> None:
+def store_semantic(pattern: str, insight: str, category: str, user_id: str) -> None:
     entry = {
         "pattern":    pattern,
         "insight":    insight,
         "category":   category,
         "timestamp":  datetime.now().isoformat(),
         "confidence": 1,
+        "user_id": user_id,
     }
 
     if CHROMA_AVAILABLE and _semantic_col is not None:
         try:
             count = _semantic_col.count()
             if count > 0:
-                existing = _semantic_col.query(query_texts=[pattern], n_results=1)
+                existing = _semantic_col.query(query_texts=[pattern], n_results=1, where={"user_id": user_id})
                 distances = existing.get("distances", [[]])[0]
                 if distances and distances[0] < 0.15:
                     existing_id   = existing["ids"][0][0]
@@ -210,13 +240,13 @@ def store_semantic(pattern: str, insight: str, category: str) -> None:
         except Exception as e:
             log.warning("semantic_store_fail", error=str(e))
 
-    data     = _load_json(SEMANTIC_FILE)
+    data     = _load_json(_user_memory_file(user_id, "semantic.json"))
     patterns = data.get("patterns", [])
     patterns.append(entry)
-    _save_json(SEMANTIC_FILE, {"patterns": patterns[-500:]})
+    _save_json(_user_memory_file(user_id, "semantic.json"), {"patterns": patterns[-500:]})
 
 
-def recall_semantic_insights(query: str, top_k: int = 5) -> list[dict]:
+def recall_semantic_insights(query: str, user_id: str, top_k: int = 5) -> list[dict]:
     if CHROMA_AVAILABLE and _semantic_col is not None:
         try:
             count = _semantic_col.count()
@@ -224,13 +254,14 @@ def recall_semantic_insights(query: str, top_k: int = 5) -> list[dict]:
                 return []
             results = _semantic_col.query(
                 query_texts=[query],
-                n_results=min(top_k, count)
+                n_results=min(top_k, count),
+                where={"user_id": user_id},
             )
             return results.get("metadatas", [[]])[0]
         except Exception as e:
             log.warning("semantic_recall_fail", error=str(e))
 
-    data = _load_json(SEMANTIC_FILE)
+    data = _load_json(_user_memory_file(user_id, "semantic.json"))
     return data.get("patterns", [])[:top_k]
 
 
@@ -281,14 +312,14 @@ LEARNING_MAP: dict[str, str] = {
 }
 
 
-def get_procedure(agent_role: str) -> str:
-    data       = _load_json(PROCEDURAL_FILE)
+def get_procedure(agent_role: str, user_id: str) -> str:
+    data       = _load_json(_user_memory_file(user_id, "procedural.json"))
     procedures = data.get("procedures", DEFAULT_PROCEDURES)
     return procedures.get(agent_role, DEFAULT_PROCEDURES.get(agent_role, ""))
 
 
-def update_procedure(agent_role: str, new_learning: str) -> None:
-    data       = _load_json(PROCEDURAL_FILE)
+def update_procedure(agent_role: str, new_learning: str, user_id: str) -> None:
+    data       = _load_json(_user_memory_file(user_id, "procedural.json"))
     procedures = data.get("procedures", DEFAULT_PROCEDURES.copy())
     current    = procedures.get(agent_role, DEFAULT_PROCEDURES.get(agent_role, ""))
 
@@ -296,19 +327,19 @@ def update_procedure(agent_role: str, new_learning: str) -> None:
         procedures[agent_role] = current.rstrip() + f"\n{new_learning}"
         log.info("procedure_updated", agent=agent_role, learning=new_learning[:60])
 
-    _save_json(PROCEDURAL_FILE, {
+    _save_json(_user_memory_file(user_id, "procedural.json"), {
         "procedures":   procedures,
         "last_updated": datetime.now().isoformat(),
     })
 
 
-def auto_learn_from_mistake(agent_role: str, mistake_type: str) -> None:
+def auto_learn_from_mistake(agent_role: str, mistake_type: str, user_id: str) -> None:
     """Derives a procedural rule from a mistake type and stores it."""
     if not mistake_type:
         return
     for pattern, learning in LEARNING_MAP.items():
         if pattern in mistake_type.lower():
-            update_procedure(agent_role, learning)
+            update_procedure(agent_role, learning, user_id)
             return
 
 
@@ -316,19 +347,19 @@ def auto_learn_from_mistake(agent_role: str, mistake_type: str) -> None:
 # LAYER 4 — TEMPORAL MEMORY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def record_temporal_event(event_type: str, details: dict) -> None:
-    data   = _load_json(TEMPORAL_FILE)
+def record_temporal_event(event_type: str, details: dict, user_id: str) -> None:
+    data   = _load_json(_user_memory_file(user_id, "temporal.json"))
     events = data.get("events", [])
     events.append({
         "timestamp":  datetime.now().isoformat(),
         "event_type": event_type,
         "details":    details,
     })
-    _save_json(TEMPORAL_FILE, {"events": events[-1000:]})
+    _save_json(_user_memory_file(user_id, "temporal.json"), {"events": events[-1000:]})
 
 
-def get_temporal_insights() -> dict:
-    data   = _load_json(TEMPORAL_FILE)
+def get_temporal_insights(user_id: str) -> dict:
+    data   = _load_json(_user_memory_file(user_id, "temporal.json"))
     events = data.get("events", [])
     solves = [e for e in events if e["event_type"] == "solve_complete"]
 
@@ -373,11 +404,16 @@ def create_session_state(
     language: str,
     image_base64: Optional[str] = None,
     manual_ai_overrides: Optional[dict] = None,
+    user_id: str = "guest_default",
+    image_mime_type: Optional[str] = None,
 ) -> dict:
+    sanitize_user_id(user_id)
     return {
+        "user_id":              user_id,
         "problem":              problem,
         "language":             language,
         "image_base64":         image_base64,
+        "image_mime_type":      image_mime_type,
         "manual_ai_overrides":  manual_ai_overrides or {},
         # Analyzer
         "extracted_problem":    "",
