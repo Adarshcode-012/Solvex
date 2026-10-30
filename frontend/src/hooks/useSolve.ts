@@ -35,7 +35,6 @@ export function useSolve() {
    */
   const applyPipelineEvents = useCallback(
     (result: SolveResult) => {
-      const events = result.pipeline_events ?? []
       const aiUsed = result.agents_ai_used ?? {}
 
       // Mark all steps that appear in events as done/failed
