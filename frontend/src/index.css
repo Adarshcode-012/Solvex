@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+    background: #08090e;
+    color: #e2e4f0;
+  }
+
+  ::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2f3347;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #818cf8;
+  }
+}
+
+@layer components {
+  .panel-divider {
+    @apply border-r border-border;
+  }
+
+  .card {
+    @apply bg-surface2 border border-border rounded-xl overflow-hidden;
+  }
+
+  .card-header {
+    @apply flex items-center justify-between px-4 py-3 bg-surface border-b border-border;
+  }
+
+  .card-title {
+    @apply text-[10px] font-bold tracking-[1.5px] uppercase text-mid flex items-center gap-2;
+  }
+
+  .badge {
+    @apply text-[10px] font-bold px-2.5 py-0.5 rounded-full;
+  }
+
+  .badge-green  { @apply bg-green/10  text-green; }
+  .badge-red    { @apply bg-red/10    text-red; }
+  .badge-accent { @apply bg-accent/10 text-accent; }
+  .badge-yellow { @apply bg-yellow/10 text-yellow; }
+  .badge-purple { @apply bg-purple/10 text-purple; }
+
+  .btn {
+    @apply px-3 py-1.5 rounded-lg border border-border2 bg-transparent text-mid
+           text-[11px] font-semibold cursor-pointer transition-all duration-150
+           hover:border-accent hover:text-accent font-sans;
+  }
+
+  .btn-primary {
+    @apply px-4 py-3 rounded-xl border-none
+           bg-gradient-to-r from-accent to-purple text-white
+           text-sm font-bold cursor-pointer transition-all duration-200
+           hover:-translate-y-0.5 hover:shadow-lg hover:shadow-accent/20
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:translate-y-0
+           font-sans w-full;
+  }
+
+  .input-field {
+    @apply w-full bg-surface2 border border-border rounded-xl text-sm text-[#e2e4f0]
+           font-mono p-4 resize-none outline-none transition-colors duration-200
+           placeholder:text-dim focus:border-accent leading-relaxed;
+  }
+
+  .p-step {
+    @apply flex items-center gap-1.5 text-[10px] font-bold tracking-wide
+           uppercase whitespace-nowrap px-2.5 py-1 rounded-full border border-border2
+           text-dim transition-all duration-300;
+  }
+  .p-step-active {
+    @apply border-accent text-accent bg-accent/10
+           shadow-[0_0_12px_rgba(129,140,248,0.25)];
+  }
+  .p-step-done   { @apply border-green  text-green  bg-green/10; }
+  .p-step-failed { @apply border-red    text-red    bg-red/10; }
+}

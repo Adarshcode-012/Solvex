@@ -1,0 +1,15 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - solvex_memory:/app/memory/data
+      - solvex_chroma:/app/memory/chroma_db
+    restart: unless-stopped
+
+volumes:
+  solvex_memory:
+  solvex_chroma:
