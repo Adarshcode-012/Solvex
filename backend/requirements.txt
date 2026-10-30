@@ -9,8 +9,7 @@ langchain-core==0.3.51
 litellm==1.83.0
 
 # ── Memory / Vector DB ────────────────────────────────────────
-chromadb==0.5.23
-# Note: 0.5.x is the last stable before 0.6 API breaking changes
+chromadb==1.5.9
 
 # ── Backend Server ─────────────────────────────────────────────
 fastapi==0.115.12

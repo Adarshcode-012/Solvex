@@ -18,6 +18,7 @@ A memory layer (episodic, semantic, procedural, temporal — backed by local JSO
 
 - **Backend**: FastAPI, LangGraph, LiteLLM (multi-provider AI routing), ChromaDB
 - **Frontend**: React, TypeScript, Vite, Tailwind
+- **Runtime**: Python 3.13 and Node.js 20.19+
 
 ## Getting started
 
@@ -44,13 +45,13 @@ Open `http://localhost:5173`.
 
 ## Configuration
 
-All configuration is via environment variables — see `backend/.env.example` and `frontend/.env.example` for the full list. At minimum you'll need one AI provider key (Anthropic, OpenAI, or Gemini) and an `APP_SECRET_KEY` to authenticate requests between the frontend and backend.
+All configuration is via environment variables — see `backend/.env.example` and `frontend/.env.example` for the full list. At minimum you'll need one AI provider key (Anthropic, OpenAI, or Gemini) and a `GUEST_SESSION_SECRET` (or `APP_SECRET_KEY`) to sign guest sessions. Set `MEMORY_BACKEND=chroma` for vector memory or `MEMORY_BACKEND=json` for the explicit JSON backend.
 
 A Judge0 API key is optional: without it, the Judge step is skipped and results are marked `unverified` rather than pretending to have compiled and run the code.
 
 ## Deployment
 
-A `Dockerfile` and `docker-compose.yml` are included for the backend. In production, set `APP_ENV=production` — the app will refuse to start unless `APP_SECRET_KEY` is set and `CORS_ORIGINS` is a real domain (not `*`), so a misconfigured deployment fails loudly instead of shipping unprotected.
+A `Dockerfile` and `docker-compose.yml` are included for the backend. In production, set `APP_ENV=production` — the app will refuse to start unless a guest session secret and valid HTTPS `CORS_ORIGINS` are set. If `MEMORY_BACKEND=chroma`, Chroma must also start successfully; otherwise production boot fails instead of silently falling back to JSON.
 
 ## License
 

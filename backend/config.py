@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     # ── Memory ─────────────────────────────────────────────────────────────────
     chroma_db_path: str = Field("./memory/chroma_db", validation_alias="CHROMA_DB_PATH")
+    memory_backend: str = Field("chroma", validation_alias="MEMORY_BACKEND")
 
     # ── App ────────────────────────────────────────────────────────────────────
     judge_max_iterations: int  = Field(5,     validation_alias="JUDGE_MAX_ITERATIONS")
@@ -67,6 +68,12 @@ class Settings(BaseSettings):
                 "  OPENAI_API_KEY=sk-...\n"
                 "  GEMINI_API_KEY=AIza...\n"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_memory_backend(self) -> "Settings":
+        if self.memory_backend not in {"chroma", "json"}:
+            raise ValueError("MEMORY_BACKEND must be 'chroma' or 'json'.")
         return self
 
     @property

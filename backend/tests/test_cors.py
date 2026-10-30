@@ -22,3 +22,11 @@ def test_https_cors_origin_allowed_in_production():
         cors_origins="https://app.example.com",
     )
     assert settings.cors_origins_list == ["https://app.example.com"]
+
+
+def test_memory_backend_accepts_only_explicit_values():
+    with pytest.raises(ValidationError):
+        Settings(openai_api_key="test-placeholder", memory_backend="sqlite")
+
+    settings = Settings(openai_api_key="test-placeholder", memory_backend="json")
+    assert settings.memory_backend == "json"

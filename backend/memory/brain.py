@@ -48,6 +48,8 @@ _semantic_col    = None
 _chroma_client   = None
 
 try:
+    if settings.memory_backend == "json":
+        raise ImportError("MEMORY_BACKEND=json")
     import chromadb
     from chromadb.config import Settings as ChromaSettings
     # ChromaDB 0.5.x API. anonymized_telemetry=False: a backend service
@@ -69,7 +71,15 @@ try:
     CHROMA_AVAILABLE = True
     log.info("chromadb_ready", path=settings.chroma_db_path)
 except Exception as e:
+    if settings.app_env == "production" and settings.memory_backend == "chroma":
+        raise RuntimeError(
+            "MEMORY_BACKEND=chroma but ChromaDB could not start; refusing production boot."
+        ) from e
     log.warning("chromadb_unavailable", error=str(e), fallback="json")
+
+
+def active_memory_backend() -> str:
+    return "chroma" if CHROMA_AVAILABLE else "json"
 
 
 def reset_chroma_collections() -> dict[str, int]:
