@@ -18,6 +18,14 @@ from typing import Optional
 
 from config import settings
 from logger import log
+from memory.metadata import (
+    get_procedure as get_sqlite_procedure,
+    update_procedure as update_sqlite_procedure,
+    record_event as record_sqlite_event,
+    list_events as list_sqlite_events,
+    list_procedures as list_sqlite_procedures,
+    reset_user_metadata,
+)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MEMORY_DIR      = os.path.join(os.path.dirname(__file__), "data")
@@ -323,24 +331,26 @@ LEARNING_MAP: dict[str, str] = {
 
 
 def get_procedure(agent_role: str, user_id: str) -> str:
-    data       = _load_json(_user_memory_file(user_id, "procedural.json"))
-    procedures = data.get("procedures", DEFAULT_PROCEDURES)
-    return procedures.get(agent_role, DEFAULT_PROCEDURES.get(agent_role, ""))
+    return get_sqlite_procedure(
+        user_id,
+        agent_role,
+        DEFAULT_PROCEDURES.get(agent_role, ""),
+    )
+
+
+def get_procedures(user_id: str) -> dict[str, str]:
+    procedures = DEFAULT_PROCEDURES.copy()
+    procedures.update(list_sqlite_procedures(user_id))
+    return procedures
 
 
 def update_procedure(agent_role: str, new_learning: str, user_id: str) -> None:
-    data       = _load_json(_user_memory_file(user_id, "procedural.json"))
-    procedures = data.get("procedures", DEFAULT_PROCEDURES.copy())
-    current    = procedures.get(agent_role, DEFAULT_PROCEDURES.get(agent_role, ""))
+    current = get_procedure(agent_role, user_id)
 
     if new_learning.lower().strip() not in current.lower():
-        procedures[agent_role] = current.rstrip() + f"\n{new_learning}"
+        procedure = current.rstrip() + f"\n{new_learning}"
+        update_sqlite_procedure(user_id, agent_role, procedure)
         log.info("procedure_updated", agent=agent_role, learning=new_learning[:60])
-
-    _save_json(_user_memory_file(user_id, "procedural.json"), {
-        "procedures":   procedures,
-        "last_updated": datetime.now().isoformat(),
-    })
 
 
 def auto_learn_from_mistake(agent_role: str, mistake_type: str, user_id: str) -> None:
@@ -358,19 +368,11 @@ def auto_learn_from_mistake(agent_role: str, mistake_type: str, user_id: str) ->
 # ══════════════════════════════════════════════════════════════════════════════
 
 def record_temporal_event(event_type: str, details: dict, user_id: str) -> None:
-    data   = _load_json(_user_memory_file(user_id, "temporal.json"))
-    events = data.get("events", [])
-    events.append({
-        "timestamp":  datetime.now().isoformat(),
-        "event_type": event_type,
-        "details":    details,
-    })
-    _save_json(_user_memory_file(user_id, "temporal.json"), {"events": events[-1000:]})
+    record_sqlite_event(user_id, event_type, details)
 
 
 def get_temporal_insights(user_id: str) -> dict:
-    data   = _load_json(_user_memory_file(user_id, "temporal.json"))
-    events = data.get("events", [])
+    events = list_sqlite_events(user_id)
     solves = [e for e in events if e["event_type"] == "solve_complete"]
 
     if not solves:

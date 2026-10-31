@@ -15,6 +15,7 @@ from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 import litellm
+import redis
 from litellm import acompletion
 from litellm.exceptions import (
     RateLimitError,
@@ -61,8 +62,27 @@ FREE_TIER_LIMITS: dict[str, dict] = {
 
 # ── Usage stats (persisted to disk) ───────────────────────────────────────────
 _USAGE_FILE = os.path.join(os.path.dirname(__file__), "..", "memory", "data", "usage_stats.json")
+_USAGE_REDIS_KEY = "solvex:usage"
+
+
+def _redis_usage_client():
+    if not settings.redis_url:
+        return None
+    return redis.Redis.from_url(settings.redis_url, decode_responses=True)
 
 def _load_usage() -> dict:
+    client = _redis_usage_client()
+    if client is not None:
+        values = client.hgetall(_USAGE_REDIS_KEY)
+        if values:
+            return {
+                key: {
+                    "calls": int(values.get(f"{key}:calls", 0)),
+                    "tokens_in": int(values.get(f"{key}:tokens_in", 0)),
+                    "tokens_out": int(values.get(f"{key}:tokens_out", 0)),
+                }
+                for key in FREE_TIER_LIMITS
+            }
     os.makedirs(os.path.dirname(_USAGE_FILE), exist_ok=True)
     if os.path.exists(_USAGE_FILE):
         with open(_USAGE_FILE) as f:
@@ -70,6 +90,15 @@ def _load_usage() -> dict:
     return {k: {"calls": 0, "tokens_in": 0, "tokens_out": 0} for k in FREE_TIER_LIMITS}
 
 def _save_usage(stats: dict) -> None:
+    client = _redis_usage_client()
+    if client is not None:
+        mapping = {
+            f"{key}:{field}": value
+            for key, values in stats.items()
+            for field, value in values.items()
+        }
+        client.hset(_USAGE_REDIS_KEY, mapping=mapping)
+        return
     with open(_USAGE_FILE, "w") as f:
         json.dump(stats, f, indent=2)
 
@@ -240,6 +269,9 @@ def reset_usage_stats() -> None:
     """Resets all usage counters. Called from admin endpoint."""
     global _usage_stats
     _usage_stats = {k: {"calls": 0, "tokens_in": 0, "tokens_out": 0} for k in FREE_TIER_LIMITS}
+    client = _redis_usage_client()
+    if client is not None:
+        client.delete(_USAGE_REDIS_KEY)
     _save_usage(_usage_stats)
     log.info("usage_stats_reset")
 

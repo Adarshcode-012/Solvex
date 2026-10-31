@@ -45,6 +45,8 @@ from memory.brain import (
     _episodic_col,
     _semantic_col,
     reset_user_memory,
+    get_procedures,
+    reset_user_metadata,
 )
 
 
@@ -99,7 +101,10 @@ def get_rate_limit_key(request: Request) -> str:
     return _verify_guest_cookie(request.cookies.get(SESSION_COOKIE)) or get_remote_address(request)
 
 
-limiter = Limiter(key_func=get_rate_limit_key)
+limiter = Limiter(
+    key_func=get_rate_limit_key,
+    storage_uri=settings.rate_limit_storage_uri,
+)
 
 
 # ── Lifespan (startup/shutdown logging) ───────────────────────────────────────
@@ -114,6 +119,9 @@ async def lifespan(app: FastAPI):
             "app_secret_key_unset",
             msg="APP_SECRET_KEY not set — endpoints are UNPROTECTED. Fine for local dev only."
         )
+    if settings.app_env == "production" and settings.redis_url:
+        import redis
+        redis.Redis.from_url(settings.redis_url).ping()
     yield
     log.info("solvex_shutdown")
 
@@ -466,7 +474,7 @@ async def brain_stats(user_id: str = Depends(get_current_user)):
     """
     episodic = _load_json(_user_memory_file(user_id, "episodic.json"))
     semantic = _load_json(_user_memory_file(user_id, "semantic.json"))
-    proc     = _load_json(_user_memory_file(user_id, "procedural.json"))
+    procedures = get_procedures(user_id)
 
     entries  = episodic.get("entries", [])
     patterns = semantic.get("patterns", [])
@@ -484,7 +492,7 @@ async def brain_stats(user_id: str = Depends(get_current_user)):
         "pass_rate":        round((passed / max(total, 1)) * 100, 1),
         "patterns_learned": len(patterns),
         "languages_used":   langs,
-        "procedures_count": len(proc.get("procedures", {})),
+        "procedures_count": len(procedures),
         "recent_solves": [
             {
                 "problem":    e.get("problem", "")[:80],
@@ -508,10 +516,10 @@ async def brain_temporal(user_id: str = Depends(get_current_user)):
 @app.get("/brain/procedures")
 async def brain_procedures(user_id: str = Depends(get_current_user)):
     """Returns current learned procedures for each agent (what they've learned)."""
-    data = _load_json(_user_memory_file(user_id, "procedural.json"))
+    procedures = get_procedures(user_id)
     return {
-        "procedures":   data.get("procedures", DEFAULT_PROCEDURES),
-        "last_updated": data.get("last_updated", "Never"),
+        "procedures":   procedures,
+        "last_updated": "SQLite WAL",
     }
 
 
@@ -522,6 +530,7 @@ async def brain_reset(user_id: str = Depends(get_current_user)):
     Use this if you want the brain to forget everything.
     """
     deleted = reset_user_memory(user_id)
+    deleted.update(reset_user_metadata(user_id))
     for path, key in [
         (_user_memory_file(user_id, "episodic.json"), "entries"),
         (_user_memory_file(user_id, "semantic.json"), "patterns"),
@@ -530,8 +539,6 @@ async def brain_reset(user_id: str = Depends(get_current_user)):
         data = _load_json(path)
         deleted[key] = len(data.get(key, []))
         _save_json(path, {})
-    deleted["procedures"] = len(_load_json(_user_memory_file(user_id, "procedural.json")).get("procedures", {}))
-    _save_json(_user_memory_file(user_id, "procedural.json"), {"procedures": DEFAULT_PROCEDURES})
     log.info("brain_reset")
     return {"message": "All memory cleared. Brain reset to defaults.", "deleted": deleted}
 

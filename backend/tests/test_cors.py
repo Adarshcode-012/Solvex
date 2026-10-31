@@ -20,6 +20,8 @@ def test_https_cors_origin_allowed_in_production():
         app_env="production",
         app_secret_key="test-secret",
         cors_origins="https://app.example.com",
+        redis_url="redis://localhost:6379/0",
+        rate_limit_storage_uri="redis://localhost:6379/1",
     )
     assert settings.cors_origins_list == ["https://app.example.com"]
 

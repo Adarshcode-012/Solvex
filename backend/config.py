@@ -34,6 +34,8 @@ class Settings(BaseSettings):
 
     # ── Rate limiting (protects paid AI calls from abuse) ───────────────────────
     solve_rate_limit: str = Field("5/minute", validation_alias="SOLVE_RATE_LIMIT")
+    rate_limit_storage_uri: str = Field("memory://", validation_alias="RATE_LIMIT_STORAGE_URI")
+    redis_url: Optional[str] = Field(None, validation_alias="REDIS_URL")
 
     # ── Judge0 ─────────────────────────────────────────────────────────────────
     judge0_api_key:  Optional[str] = Field(None, validation_alias="JUDGE0_API_KEY")
@@ -74,6 +76,16 @@ class Settings(BaseSettings):
     def validate_memory_backend(self) -> "Settings":
         if self.memory_backend not in {"chroma", "json"}:
             raise ValueError("MEMORY_BACKEND must be 'chroma' or 'json'.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_process_storage(self) -> "Settings":
+        if self.app_env == "production" and (
+            not self.redis_url or self.rate_limit_storage_uri == "memory://"
+        ):
+            raise ValueError(
+                "Production requires REDIS_URL and a non-memory RATE_LIMIT_STORAGE_URI."
+            )
         return self
 
     @property
