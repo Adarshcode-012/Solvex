@@ -1,15 +1,57 @@
 services:
-  backend:
+  api:
     build: ./backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
+    environment:
+      MEMORY_BACKEND: ${MEMORY_BACKEND:-chroma}
+      REDIS_URL: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in backend/.env}@redis:6379/0"
+      RATE_LIMIT_STORAGE_URI: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in backend/.env}@redis:6379/1"
+      TRUSTED_PROXIES: 172.30.0.4/32
+    depends_on:
+      redis:
+        condition: service_healthy
     volumes:
       - solvex_memory:/app/memory/data
       - solvex_chroma:/app/memory/chroma_db
     restart: unless-stopped
 
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in backend/.env}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - solvex_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    networks:
+      default:
+        ipv4_address: 172.30.0.4
+    ports:
+      - "${FRONTEND_HOST_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   solvex_memory:
   solvex_chroma:
+  solvex_redis:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

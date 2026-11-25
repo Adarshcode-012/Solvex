@@ -1,0 +1,93 @@
+name: Compose smoke
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: docker-compose.yml:.github/compose-smoke.override.json
+      API_HOST_PORT: "18000"
+      FRONTEND_HOST_PORT: "15173"
+      REDIS_PASSWORD: ci-smoke-public-fixture
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build and start Compose stack
+        run: docker compose up -d --build
+
+      - name: Show services
+        if: always()
+        run: |
+          docker compose ps
+          docker compose logs --tail 60 api redis frontend
+
+      - name: Check public routes and CSRF
+        run: |
+          python - <<'PY'
+          import http.cookiejar
+          import json
+          import urllib.error
+          import urllib.request
+
+          base = "http://127.0.0.1:15173"
+
+          def request(path, method="GET", body=None, headers=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(base + path, data=data, method=method, headers=headers or {})
+              try:
+                  return urllib.request.urlopen(req, timeout=20)
+              except urllib.error.HTTPError as exc:
+                  return exc
+
+          health = request("/api/health")
+          assert health.status == 200 and json.load(health) == {"status": "ok"}
+
+          stats = request("/api/brain/stats")
+          assert stats.status == 200
+          cookies = {}
+          for header in stats.headers.get_all("Set-Cookie", []):
+              pair = header.split(";", 1)[0]
+              name, value = pair.split("=", 1)
+              cookies[name] = value
+          assert "solvex_guest" in cookies and "solvex_csrf" in cookies, "guest/CSRF cookies missing"
+          cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+          reset_headers = {"Cookie": cookie_header}
+          no_csrf = request("/api/brain/reset", "POST", headers=reset_headers)
+          assert no_csrf.status == 403, f"reset without CSRF returned {no_csrf.status}"
+          reset_headers["X-CSRF-Token"] = cookies["solvex_csrf"]
+          reset = request("/api/brain/reset", "POST", headers=reset_headers)
+          assert reset.status == 200, f"reset with CSRF returned {reset.status}"
+
+          solve = request("/api/solve", "POST", {"problem": "", "language": "python"}, {
+              "Content-Type": "application/json", "Cookie": cookie_header,
+              "X-CSRF-Token": cookies["solvex_csrf"],
+          })
+          assert solve.status == 422, f"empty solve returned {solve.status}"
+
+          for path in ("/api/health/detailed", "/api/usage/reset"):
+              response = request(path)
+              assert response.status == 404, f"{path} returned {response.status}"
+          print("Compose HTTP smoke: all route and CSRF assertions passed")
+          PY
+
+      - name: Check Redis requires authentication
+        run: |
+          unauthenticated="$(docker compose exec -T redis redis-cli ping 2>&1 || true)"
+          printf '%s\n' "$unauthenticated" | grep -q 'NOAUTH Authentication required.'
+          authenticated="$(docker compose exec -T -e REDISCLI_AUTH="$REDIS_PASSWORD" redis redis-cli ping)"
+          test "$authenticated" = PONG
+          printf 'Redis auth smoke: unauthenticated=NOAUTH; authenticated=%s\n' "$authenticated"
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down

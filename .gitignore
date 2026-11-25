@@ -12,8 +12,15 @@ build/
 .env
 
 # Memory data (local to your machine)
+/memory/
 backend/memory/chroma_db/
 backend/memory/data/
+*.sqlite*
+
+# Local dependency audit and test-run artifacts
+/.phase2-*
+/.pip-audit-*.json
+**/.pytest_cache/
 
 # Node
 node_modules/
@@ -31,3 +38,23 @@ Thumbs.db
 
 # Logs
 *.log
+
+# local test and review files
+.pytest-*/
+*-raw.txt
+*-output.txt
+*.tmp
+/JOB_RELIABILITY.md
+/scripts/job_mutation_check.py
+/.audit-*/
+/.validation-*/
+.env.*
+!.env.example
+
+# local editor and assistant settings
+.claude/
+.cursor/
+.codex/
+.github/copilot*
+AGENTS.md
+CLAUDE.md

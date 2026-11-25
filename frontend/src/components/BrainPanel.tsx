@@ -33,7 +33,6 @@ export function BrainPanel() {
 
   return (
     <div className="fixed right-0 top-[52px] bottom-0 w-[300px] bg-surface border-l border-border2 z-40 flex flex-col">
-      {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
         <span className="text-[11px] font-bold tracking-[1.5px] uppercase text-mid flex items-center gap-2">
           🧠 Brain Memory
@@ -48,7 +47,6 @@ export function BrainPanel() {
         </div>
       </div>
 
-      {/* Tabs */}
       <div className="flex border-b border-border">
         {(['stats', 'history', 'insights'] as const).map((t) => (
           <button
@@ -64,7 +62,6 @@ export function BrainPanel() {
         ))}
       </div>
 
-      {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
         {loading ? (
           <div className="flex items-center justify-center h-32 text-dim text-sm">
@@ -72,7 +69,6 @@ export function BrainPanel() {
           </div>
         ) : (
           <>
-            {/* Stats tab */}
             {tab === 'stats' && stats && (
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-3">
@@ -97,7 +93,6 @@ export function BrainPanel() {
                   </div>
                 )}
 
-                {/* Languages */}
                 {Object.keys(stats.languages_used).length > 0 && (
                   <div>
                     <div className="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Languages</div>
@@ -112,7 +107,6 @@ export function BrainPanel() {
                   </div>
                 )}
 
-                {/* Category breakdown */}
                 {temporal?.by_category && Object.keys(temporal.by_category).length > 0 && (
                   <div>
                     <div className="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">By Category</div>
@@ -137,7 +131,6 @@ export function BrainPanel() {
               </div>
             )}
 
-            {/* History tab */}
             {tab === 'history' && stats && (
               <div className="space-y-2">
                 {stats.recent_solves.length === 0 ? (
@@ -162,7 +155,6 @@ export function BrainPanel() {
               </div>
             )}
 
-            {/* Insights tab */}
             {tab === 'insights' && (
               <div className="space-y-3">
                 <p className="text-[11px] text-dim leading-relaxed">

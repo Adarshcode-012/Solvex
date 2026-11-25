@@ -1,0 +1,15 @@
+{
+  "services": {
+    "api": {
+      "environment": {
+        "APP_ENV": "production",
+        "CORS_ORIGINS": "https://localhost:15173",
+        "GUEST_SESSION_SECRET": "public-ci-smoke-fixture-guest-signing-only",
+        "ADMIN_TOKEN": "public-ci-smoke-fixture-admin-token-only",
+        "OPENAI_API_KEY": "fake-key-for-tests-0123456789",
+        "MEMORY_BACKEND": "chroma",
+        "GLOBAL_DAILY_SOLVE_CAP": "200"
+      }
+    }
+  }
+}

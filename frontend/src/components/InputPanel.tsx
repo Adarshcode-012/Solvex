@@ -68,13 +68,11 @@ export function InputPanel() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden relative">
-      {/* Panel header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-surface shrink-0">
         <span className="text-[10px] font-bold tracking-[2px] uppercase text-dim">
           Problem Input
         </span>
         <div className="flex items-center gap-2">
-          {/* Language selector */}
           <div className="flex gap-1">
             {LANGUAGES.map((l) => (
               <button
@@ -94,7 +92,6 @@ export function InputPanel() {
 
           <div className="w-px h-4 bg-border2" />
 
-          {/* AI Config button */}
           <button
             onClick={() => setShowAiPanel(!showAiPanel)}
             className={clsx(
@@ -109,13 +106,10 @@ export function InputPanel() {
           </button>
         </div>
 
-        {/* AI Config dropdown */}
         {showAiPanel && <AiConfigPanel onClose={() => setShowAiPanel(false)} />}
       </div>
 
-      {/* Input body */}
       <div className="flex-1 flex flex-col p-4 gap-3 overflow-y-auto" onKeyDown={handleKeyDown}>
-        {/* Problem text area using CodeMirror */}
         <div className="flex-1 min-h-[240px] rounded-xl overflow-hidden border border-border focus-within:border-accent transition-colors duration-200">
           <CodeMirror
             value={problem}
@@ -132,7 +126,6 @@ export function InputPanel() {
           />
         </div>
 
-        {/* Image upload zone */}
         <div
           onClick={() => fileRef.current?.click()}
           onDrop={handleDrop}
@@ -172,7 +165,6 @@ export function InputPanel() {
           onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
         />
 
-        {/* Solve button */}
         <button
           onClick={solve}
           disabled={solving}

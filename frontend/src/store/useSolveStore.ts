@@ -17,34 +17,28 @@ function makeInitialSteps(): PipelineStep[] {
 }
 
 interface SolveStore {
-  // ── Input ───────────────────────────────────────────────────────────────────
   problem:    string
   language:   Language
   imageFile:  File | null
 
-  // ── AI Config ───────────────────────────────────────────────────────────────
   aiMode:          AiMode
   manualOverrides: Record<string, string>
   aiConfig:        AiConfig | null
 
-  // ── Solve state ─────────────────────────────────────────────────────────────
   solving:       boolean
   pipelineSteps: PipelineStep[]
   result:        SolveResult | null
   error:         string | null
-  rateLimitInfo: { ai: string; ai_label: string; message: string } | null
+  rateLimitInfo: { ai: string; ai_label: string; message: string; retryAfterSeconds?: number } | null
 
-  // ── Usage ───────────────────────────────────────────────────────────────────
   usage: UsageStats | null
 
-  // ── UI ──────────────────────────────────────────────────────────────────────
   showBrainPanel:  boolean
   showAiPanel:     boolean
   showReasoning:   boolean
   showExplanation: boolean
   explanationText: string
 
-  // ── Actions ─────────────────────────────────────────────────────────────────
   setProblem:       (p: string)         => void
   setLanguage:      (l: Language)       => void
   setImageFile:     (f: File | null)    => void
@@ -55,7 +49,7 @@ interface SolveStore {
   setSolving:       (v: boolean)        => void
   setResult:        (r: SolveResult | null) => void
   setError:         (e: string | null)  => void
-  setRateLimitInfo: (i: { ai: string; ai_label: string; message: string } | null) => void
+  setRateLimitInfo: (i: { ai: string; ai_label: string; message: string; retryAfterSeconds?: number } | null) => void
   setStepStatus:    (role: AgentRole, status: PipelineStep['status'], ai?: string) => void
   resetPipeline:    ()                  => void
   setShowBrainPanel:(v: boolean)        => void

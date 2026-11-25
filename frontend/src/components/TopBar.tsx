@@ -54,7 +54,6 @@ export function TopBar() {
   const { usage, setUsage, showBrainPanel, setShowBrainPanel } = useSolveStore()
 
   useEffect(() => {
-    // Load usage on mount and every 30 seconds
     const load = () => api.getUsage().then(setUsage).catch(() => {})
     load()
     const id = setInterval(load, 30_000)
@@ -63,7 +62,6 @@ export function TopBar() {
 
   return (
     <header className="h-13 flex items-center px-5 border-b border-border bg-surface gap-4 z-50 shrink-0" style={{ height: 52 }}>
-      {/* Logo */}
       <div className="flex items-center gap-2.5">
         <Zap size={18} className="text-accent" />
         <span className="text-[17px] font-bold tracking-tight">
@@ -76,7 +74,6 @@ export function TopBar() {
 
       <div className="w-px h-5 bg-border2" />
 
-      {/* Usage bars */}
       {usage && (
         <div className="flex items-center gap-5 flex-1">
           {(Object.entries(usage) as [string, UsageStat][]).map(([key, stat]) => (
@@ -85,7 +82,6 @@ export function TopBar() {
         </div>
       )}
 
-      {/* Right actions */}
       <div className="flex items-center gap-3 ml-auto">
         <button
           onClick={() => setShowBrainPanel(!showBrainPanel)}
