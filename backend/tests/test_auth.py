@@ -1,9 +1,10 @@
 import os
 
-os.environ.setdefault("OPENAI_API_KEY", "test-placeholder")
+os.environ.setdefault("OPENAI_API_KEY", "fake-key-for-tests-0123456789")
 
 from fastapi.testclient import TestClient
 
+import main
 from main import app
 
 
@@ -23,7 +24,19 @@ def test_guest_session_is_issued_and_csrf_protects_followup_post():
     assert allowed.status_code == 200
 
 
-def test_health_is_public_but_detailed_health_is_not_admin_access():
+def test_health_is_public_but_detailed_health_is_hidden_without_admin_token():
     client = TestClient(app)
     assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/health/detailed").status_code == 403
+    assert client.get("/health/detailed").status_code == 404
+
+
+def test_development_lifespan_does_not_claim_endpoints_are_unprotected(caplog, monkeypatch):
+    monkeypatch.setattr(main.settings, "app_secret_key", None)
+    monkeypatch.setattr(main.settings, "guest_session_secret", None)
+    monkeypatch.setattr(main.settings, "app_env", "development")
+
+    with TestClient(app):
+        pass
+
+    assert "APP_SECRET_KEY not set" not in caplog.text
+    assert "endpoints are UNPROTECTED" not in caplog.text
