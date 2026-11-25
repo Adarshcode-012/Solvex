@@ -34,14 +34,20 @@ export interface SolveResult {
   alternate_approaches: AlternateApproach[]
   review_notes:         string
   iterations_used:      number
-  // False when the pass/fail result came from a simulated Judge0 run
-  // (no JUDGE0_API_KEY configured on the backend) rather than a real execution.
   verified:             boolean
   error_message:        string
   extracted_problem:    string
   constraints:          Record<string, unknown>
   agents_ai_used:       Record<AgentRole, string>
   pipeline_events:      PipelineEvent[]
+  timings?:             Array<{ role: AgentRole; seconds: number }>
+}
+
+export interface SolveJobSnapshot {
+  status: 'running' | 'complete' | 'failed'
+  events: Array<{ agent: AgentRole; status: string }>
+  result: SolveResult | null
+  error: { type?: string; ai?: string; ai_label?: string; message?: string; retry_after?: number; code?: string; request_id?: string } | null
 }
 
 export interface ExplanationResponse {

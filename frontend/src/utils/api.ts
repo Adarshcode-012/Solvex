@@ -1,18 +1,43 @@
 import axios from 'axios'
 import type {
   SolveResult, UsageStats, AiConfig, ExplanationResponse,
-  BrainStats, TemporalInsights, HealthStatus, Language,
+  BrainStats, TemporalInsights, HealthStatus, Language, SolveJobSnapshot,
 } from '@/types'
 
-// In development: Vite proxies /api → http://localhost:8000
-// In production: set VITE_API_URL env var
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
+export const API_TIMEOUT_MS = 600_000
 
 const client = axios.create({
   baseURL: BASE_URL,
-  timeout: 180_000, // 3 min — agent pipeline can take 90s+
+  timeout: API_TIMEOUT_MS,
   withCredentials: true,
 })
+
+export function formatApiError(detail: unknown): string | null {
+  if (typeof detail === 'string') return detail
+  if (typeof detail !== 'object' || detail === null) return null
+
+  const value = detail as Record<string, unknown>
+  if (
+    (
+      value.code === 'ai_auth_failed' ||
+      value.code === 'ai_key_missing' ||
+      value.code === 'ai_provider_timeout'
+    ) &&
+    typeof value.message === 'string'
+  ) {
+    return `${value.code}: ${value.message}`
+  }
+  if (typeof value.message === 'string') return value.message
+  return null
+}
+
+export function formatApiErrorForResponse(detail: unknown, status?: number): string | null {
+  return formatApiError(detail) ??
+    (status === 504
+      ? 'ai_provider_timeout: The AI request timed out. Check backend and provider connectivity, then retry.'
+      : null)
+}
 
 client.interceptors.request.use((config) => {
   const csrf = document.cookie
@@ -23,23 +48,30 @@ client.interceptors.request.use((config) => {
   return config
 })
 
-// ── Response interceptor: unwrap Axios errors into plain messages ──────────────
 client.interceptors.response.use(
   (res) => res,
   (err) => {
     const detail = err.response?.data?.detail
     if (detail && typeof detail === 'object' && detail.error === 'rate_limit') {
-      return Promise.reject({ type: 'rate_limit', ...detail })
+      return Promise.reject({
+        type: 'rate_limit',
+        ...detail,
+        retryAfter: err.response?.headers?.['retry-after'],
+      })
     }
     const message =
-      (typeof detail === 'string' ? detail : null) ??
+      formatApiErrorForResponse(detail, err.response?.status) ??
       err.message ??
       'Unknown error'
-    return Promise.reject(new Error(message))
+    const requestId = err.response?.data?.request_id ?? err.response?.headers?.['x-request-id']
+    return Promise.reject(new Error(
+      err.response
+        ? message + (requestId ? ` (Request ID: ${requestId})` : '')
+        : `network_error: ${message}`
+    ))
   }
 )
 
-// ── API functions ─────────────────────────────────────────────────────────────
 
 export const api = {
   health(): Promise<HealthStatus> {
@@ -58,6 +90,22 @@ export const api = {
         manual_ai_overrides: manualOverrides ?? null,
       })
       .then((r) => r.data)
+  },
+
+  startSolveJob(
+    problem: string,
+    language: Language,
+    manualOverrides?: Record<string, string> | null,
+  ): Promise<{ job_id: string; max_seconds?: number }> {
+    return client.post('/solve/jobs', {
+      problem,
+      language,
+      manual_ai_overrides: manualOverrides ?? null,
+    }).then((r) => r.data)
+  },
+
+  getSolveJob(jobId: string): Promise<SolveJobSnapshot> {
+    return client.get(`/solve/jobs/${encodeURIComponent(jobId)}`).then((r) => r.data)
   },
 
   solveImage(
