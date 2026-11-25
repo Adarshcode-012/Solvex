@@ -7,42 +7,22 @@ on:
 jobs:
   compose-smoke:
     runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: docker-compose.yml:.github/compose-smoke.override.json
+      API_HOST_PORT: "18000"
+      FRONTEND_HOST_PORT: "15173"
+      REDIS_PASSWORD: ci-smoke-public-fixture
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate placeholder configuration
-        run: |
-          python - <<'PY'
-          import os
-          import secrets
-          from pathlib import Path
-
-          values = {
-              "REDIS_PASSWORD": secrets.token_urlsafe(36),
-              "GUEST_SESSION_SECRET": secrets.token_urlsafe(48),
-              "APP_SECRET_KEY": secrets.token_urlsafe(48),
-              "ADMIN_TOKEN": secrets.token_urlsafe(36),
-          }
-          values.update({
-              "APP_ENV": "production",
-              "CORS_ORIGINS": "https://localhost:15173",
-              "OPENAI_API_KEY": "test-placeholder",
-              "MEMORY_BACKEND": "chroma",
-              "GLOBAL_DAILY_SOLVE_CAP": "200",
-          })
-          Path("backend/.env").write_text(
-              "".join(f"{key}={value}\n" for key, value in values.items()),
-              encoding="utf-8",
-          )
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write("API_HOST_PORT=18000\nFRONTEND_HOST_PORT=15173\n")
-              env.write(f"REDIS_PASSWORD={values['REDIS_PASSWORD']}\n")
-          PY
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
 
       - name: Build and start Compose stack
         run: docker compose up -d --build
 
       - name: Show services
+        if: always()
         run: |
           docker compose ps
           docker compose logs --tail 60 api redis frontend
@@ -105,8 +85,6 @@ jobs:
           test "$authenticated" = PONG
           printf 'Redis auth smoke: unauthenticated=NOAUTH; authenticated=%s\n' "$authenticated"
 
-      - name: Stop containers and remove generated config
+      - name: Stop containers
         if: always()
-        run: |
-          docker compose down
-          rm -f backend/.env
+        run: docker compose down
