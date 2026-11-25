@@ -1,17 +1,3 @@
-"""
-agents/all_agents.py
-
-Implements the five pipeline agents — Analyzer, Strategist, Coder, Reviewer,
-and Judge — that make up SolveX's solving pipeline. Each agent is an async
-function that takes the shared pipeline state, calls an LLM (via
-utils.ai_router.call_ai) or Judge0 (for the Judge), and returns the updated
-state for the next stage.
-
-If an agent's AI call fails unrecoverably (auth error, malformed response,
-empty generation, etc.), it raises AgentFailure rather than silently
-continuing with placeholder data — see orchestrator.py and main.py for how
-that propagates into a real HTTP error response.
-"""
 
 import re
 import json
@@ -24,7 +10,7 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 
 from config import settings
 from logger import log
-from utils.ai_router import call_ai, RateLimitHit, AIProviderError
+from utils.ai_router import call_ai, RateLimitHit, AIProviderError, publish_progress
 from memory.brain import (
     get_procedure,
     auto_learn_from_mistake,
@@ -36,37 +22,22 @@ from memory.brain import (
 
 
 class AgentFailure(Exception):
-    """
-    Raised when an agent cannot produce a usable result and recovery isn't
-    possible (bad API key, malformed/empty AI response after retries, etc).
-    Distinct from RateLimitHit, which is transient and already handled by
-    the caller. orchestrator.py lets this propagate; main.py turns it into
-    a real HTTP error instead of a fake "passed" result.
-    """
-    def __init__(self, agent: str, reason: str):
+    def __init__(self, agent: str, reason: str, code: Optional[str] = None):
         self.agent  = agent
         self.reason = reason
+        self.code = code
         super().__init__(f"{agent} agent failed: {reason}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_json(text: str) -> dict:
-    """
-    Robustly extracts JSON from AI response.
-    Handles: ```json fences, leading/trailing text, partial wrapping.
-    """
     text = text.strip()
 
-    # Try direct parse first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Strip ```json ... ``` fences
     match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
     if match:
         try:
@@ -74,7 +45,6 @@ def _extract_json(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Find first { ... } block
     match = re.search(r"\{[\s\S]+\}", text)
     if match:
         try:
@@ -87,16 +57,12 @@ def _extract_json(text: str) -> dict:
 
 
 def _strip_code_fences(text: str) -> str:
-    """Remove ```python / ```cpp / ```java fences from code."""
     text = text.strip()
     text = re.sub(r"^```(?:python|cpp|c\+\+|java|py)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGENT 1 — ANALYZER
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def run_analyzer(state: dict) -> dict:
     log.info("agent_start", agent="analyzer")
@@ -138,6 +104,7 @@ Return ONLY valid JSON — no text outside it:
             role="analyzer",
             messages=messages,
             manual_overrides=state.get("manual_ai_overrides"),
+            max_tokens=settings.analyzer_max_tokens,
             image_base64=state.get("image_base64"),
             image_mime_type=state.get("image_mime_type", "image/png"),
         )
@@ -146,7 +113,7 @@ Return ONLY valid JSON — no text outside it:
     except (AIProviderError, ValueError) as e:
         log.error("analyzer_ai_error", error=str(e))
         state["pipeline_events"].append({"agent": "analyzer", "status": "failed", "error": str(e)})
-        raise AgentFailure("analyzer", str(e)) from e
+        raise AgentFailure("analyzer", str(e), getattr(e, "code", None)) from e
 
     state["agents_ai_used"]["analyzer"] = ai_used
     data = _extract_json(response)
@@ -169,9 +136,6 @@ Return ONLY valid JSON — no text outside it:
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGENT 2 — STRATEGIST
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def run_strategist(state: dict) -> dict:
     log.info("agent_start", agent="strategist")
@@ -240,13 +204,14 @@ Sample Output: {state['sample_outputs'][:2]}
                 {"role": "user",   "content": user_msg},
             ],
             manual_overrides=state.get("manual_ai_overrides"),
+            max_tokens=settings.strategist_max_tokens,
         )
     except RateLimitHit:
         raise
     except (AIProviderError, ValueError) as e:
         log.error("strategist_ai_error", error=str(e))
         state["pipeline_events"].append({"agent": "strategist", "status": "failed", "error": str(e)})
-        raise AgentFailure("strategist", str(e)) from e
+        raise AgentFailure("strategist", str(e), getattr(e, "code", None)) from e
 
     state["agents_ai_used"]["strategist"] = ai_used
     data = _extract_json(response)
@@ -263,7 +228,6 @@ Sample Output: {state['sample_outputs'][:2]}
     state["constraints"]["key_insight"]          = data.get("key_insight", "")
     state["constraints"]["implementation_hints"] = data.get("implementation_hints", [])
 
-    # Store new generalizable insight
     new_pattern = data.get("new_semantic_pattern", "").strip()
     if len(new_pattern) > 15:
         store_semantic(
@@ -282,9 +246,6 @@ Sample Output: {state['sample_outputs'][:2]}
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGENT 3 — CODER
-# ─────────────────────────────────────────────────────────────────────────────
 
 LANG_RULES = {
     "python": """Language: Python 3.11
@@ -350,7 +311,6 @@ Sample I/O: {list(zip(state['sample_inputs'][:2], state['sample_outputs'][:2]))}
 Write the complete {language} solution now."""
 
     else:
-        # Targeted fix — give Coder the exact failure
         if state.get("compile_error"):
             error_section = f"COMPILE/SYNTAX ERROR:\n{state['compile_error']}\nFix the syntax error only."
         elif state.get("judge_wrong_output"):
@@ -386,14 +346,14 @@ Fix ONLY the specific error. Return complete corrected code."""
                 {"role": "user",   "content": prompt},
             ],
             manual_overrides=state.get("manual_ai_overrides"),
-            max_tokens=4096,
+            max_tokens=settings.coder_max_tokens,
         )
     except RateLimitHit:
         raise
     except (AIProviderError, ValueError) as e:
         log.error("coder_ai_error", error=str(e))
         state["pipeline_events"].append({"agent": "coder", "status": "failed", "error": str(e)})
-        raise AgentFailure("coder", str(e)) from e
+        raise AgentFailure("coder", str(e), getattr(e, "code", None)) from e
 
     state["agents_ai_used"]["coder"] = ai_used
     code = _strip_code_fences(response)
@@ -408,9 +368,6 @@ Fix ONLY the specific error. Return complete corrected code."""
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGENT 4 — REVIEWER
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def run_reviewer(state: dict) -> dict:
     log.info("agent_start", agent="reviewer")
@@ -460,13 +417,14 @@ Sample: Input={state['sample_inputs'][:1]} → Expected={state['sample_outputs']
                 {"role": "user",   "content": user_msg},
             ],
             manual_overrides=state.get("manual_ai_overrides"),
+            max_tokens=settings.reviewer_max_tokens,
         )
     except RateLimitHit:
         raise
     except (AIProviderError, ValueError) as e:
         log.error("reviewer_ai_error", error=str(e))
         state["pipeline_events"].append({"agent": "reviewer", "status": "failed", "error": str(e)})
-        raise AgentFailure("reviewer", str(e)) from e
+        raise AgentFailure("reviewer", str(e), getattr(e, "code", None)) from e
 
     state["agents_ai_used"]["reviewer"] = ai_used
     data    = _extract_json(response)
@@ -493,13 +451,9 @@ Sample: Input={state['sample_inputs'][:1]} → Expected={state['sample_outputs']
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGENT 5 — JUDGE
-# ─────────────────────────────────────────────────────────────────────────────
 
 LANGUAGE_IDS = {"python": 71, "cpp": 54, "java": 62}
 
-# Judge0 status codes
 STATUS_COMPILE_ERROR  = 6
 STATUS_TLE            = 5
 STATUS_ACCEPTED       = 3
@@ -515,7 +469,7 @@ JUDGE_UNAVAILABLE = "judge_unavailable"
 
 
 class JudgeUnavailable(Exception):
-    """Raised when Judge0 cannot accept or complete a submission."""
+    pass
 
 
 def _b64e(text: str) -> str:
@@ -531,11 +485,7 @@ def _b64d(text: Optional[str]) -> str:
 
 
 async def _run_judge0(code: str, language: str, stdin: str) -> dict:
-    """Submits code to Judge0 and polls for result. Async — uses httpx +
-    asyncio.sleep so the ~1.5-18s poll wait doesn't block the event loop."""
 
-    # An agent failure upstream should never be able to masquerade as a pass —
-    # refuse to even attempt "verification" of empty code.
     if not code.strip():
         return {
             "status": {"id": STATUS_COMPILE_ERROR, "description": "No code to run"},
@@ -570,10 +520,10 @@ async def _run_judge0(code: str, language: str, stdin: str) -> dict:
             if not token:
                 raise JudgeUnavailable("Judge0 submission returned no token")
 
-            # Poll until done (max 18 seconds)
+            # retry the submission if polling ends before judge0 finishes
             result = {}
-            for _ in range(12):
-                await asyncio.sleep(1.5)
+            for _ in range(settings.judge0_poll_count):
+                await asyncio.sleep(settings.judge0_poll_interval_seconds)
                 poll = await client.get(
                     f"{settings.judge0_base_url}/submissions/{token}?base64_encoded=true",
                     headers=headers, timeout=10,
@@ -583,7 +533,7 @@ async def _run_judge0(code: str, language: str, stdin: str) -> dict:
                 if result.get("status", {}).get("id", 0) > 2:
                     break
 
-            if result.get("status", {}).get("id", 0) == 0:
+            if result.get("status", {}).get("id", 0) <= 2:
                 raise JudgeUnavailable("Judge0 polling timed out")
 
         return {
@@ -616,7 +566,6 @@ async def _run_judge0_with_retries(code: str, language: str, stdin: str) -> dict
 
 
 def _normalize(text: str) -> str:
-    """Normalize output for comparison — strip whitespace per line."""
     return "\n".join(line.strip() for line in text.strip().split("\n"))
 
 
@@ -626,11 +575,14 @@ async def run_judge(state: dict) -> dict:
     code      = state.get("generated_code", "")
     user_id   = state.get("user_id", "guest_default")
 
+    if code:
+        state["final_solution"] = code
+
+    publish_progress("judge", "started")
     log.info("agent_start", agent="judge", iteration=iteration + 1,
              max=state["judge_max_iterations"])
     state["pipeline_events"].append({"agent": "judge", "status": "started", "iteration": iteration})
 
-    # If Reviewer flagged issues (iteration 0), route back immediately
     if state.get("judge_error") and iteration == 0:
         state["judge_iteration"] = 1
         log.info("judge_routing_reviewer_fix")
@@ -646,7 +598,7 @@ async def run_judge(state: dict) -> dict:
     ))
     has_samples = bool(sample_pairs)
     if not has_samples:
-        sample_pairs = [("", "")]  # Compile-and-run only
+        sample_pairs = [("", "")]
 
     for idx, (inp, expected) in enumerate(sample_pairs):
         log.info("judge_test", test=idx + 1, of=len(sample_pairs))
@@ -666,6 +618,7 @@ async def run_judge(state: dict) -> dict:
             state["error_message"] = "Judge0 is not configured; the solution was not verified."
             state["pipeline_events"].append({"agent": "judge", "status": JUDGE_DISABLED})
             state["agents_ai_used"]["judge"] = "judge0"
+            publish_progress("judge", "unverified")
             return state
 
         status_id = result["status"]["id"]
@@ -676,6 +629,7 @@ async def run_judge(state: dict) -> dict:
             state["error_message"] = "Judge0 is unavailable; the solution was not verified."
             state["pipeline_events"].append({"agent": "judge", "status": JUDGE_UNAVAILABLE})
             state["agents_ai_used"]["judge"] = "judge0"
+            publish_progress("judge", "failed")
             return state
 
         if status_id == STATUS_COMPILE_ERROR or result["compile_output"]:
@@ -715,9 +669,9 @@ async def run_judge(state: dict) -> dict:
         state["final_solution"] = code
         state["pipeline_events"].append({"agent": "judge", "status": "compiled_only"})
         state["agents_ai_used"]["judge"] = "judge0"
+        publish_progress("judge", "done")
         return state
 
-    # ── Process result ────────────────────────────────────────────────────────
     if all_passed:
         log.info("judge_passed", iteration=iteration + 1)
         state["judge_passed"]   = True
@@ -731,6 +685,7 @@ async def run_judge(state: dict) -> dict:
             "category":   state["dsa_category"],
         }, user_id)
         state["pipeline_events"].append({"agent": "judge", "status": "passed"})
+        publish_progress("judge", "done")
 
     else:
         state["judge_iteration"] = iteration + 1
@@ -748,15 +703,14 @@ async def run_judge(state: dict) -> dict:
                 "category": state["dsa_category"],
             }, user_id)
             state["pipeline_events"].append({"agent": "judge", "status": "max_retries"})
+            publish_progress("judge", "failed")
 
         else:
             ftype = first_failure.get("type", "unknown")
             log.info("judge_failed", failure=ftype, retry=state["judge_iteration"])
 
-            # Learn from mistake
             auto_learn_from_mistake("reviewer", ftype, user_id)
 
-            # Set precise error for Coder
             state["compile_error"]      = first_failure["msg"] if ftype == JUDGE_FAILED_COMPILE else ""
             state["judge_wrong_output"] = first_failure.get("actual", "") if ftype == JUDGE_FAILED_WRONG_ANSWER else ""
             state["judge_error"]        = (
