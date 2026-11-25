@@ -40,7 +40,6 @@ export function AiConfigPanel({ onClose }: { onClose: () => void }) {
           <button onClick={onClose} className="text-dim hover:text-mid transition-colors text-lg leading-none">×</button>
         </div>
 
-        {/* Mode tabs */}
         <div className="flex gap-2 mb-4">
           {(['auto', 'manual'] as const).map((mode) => (
             <button
@@ -58,7 +57,6 @@ export function AiConfigPanel({ onClose }: { onClose: () => void }) {
           ))}
         </div>
 
-        {/* Auto assignment */}
         {aiMode === 'auto' && aiConfig && (
           <div className="space-y-1">
             {AGENTS.map(({ role, label, icon }) => {
@@ -81,7 +79,6 @@ export function AiConfigPanel({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {/* Manual assignment */}
         {aiMode === 'manual' && (
           <div className="space-y-1">
             {AGENTS.map(({ role, label, icon, bestAi }) => (
