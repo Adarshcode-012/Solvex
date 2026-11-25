@@ -8,9 +8,10 @@ const AGENT_ORDER: AgentRole[] = ['analyzer', 'strategist', 'coder', 'reviewer',
 
 interface RateLimitError {
   type: 'rate_limit'
-  ai: string
-  ai_label: string
-  message: string
+  ai?: string
+  ai_label?: string
+  message?: string
+  retryAfter?: string
 }
 
 function isRateLimitError(err: unknown): err is RateLimitError {
@@ -18,35 +19,24 @@ function isRateLimitError(err: unknown): err is RateLimitError {
     typeof err === 'object' &&
     err !== null &&
     'type' in err &&
-    (err as Record<string, unknown>).type === 'rate_limit' &&
-    'ai' in err &&
-    'ai_label' in err &&
-    'message' in err
+    (err as Record<string, unknown>).type === 'rate_limit'
   )
 }
 
 export function useSolve() {
   const store = useSolveStore()
 
-  /**
-   * Animates the pipeline steps based on pipeline_events from the result.
-   * Since the API is synchronous (not streaming), we animate after we get
-   * the result using the pipeline_events array returned from the backend.
-   */
   const applyPipelineEvents = useCallback(
     (result: SolveResult) => {
       const aiUsed = result.agents_ai_used ?? {}
 
-      // Mark all steps that appear in events as done/failed
       AGENT_ORDER.forEach((role) => {
         const ai = aiUsed[role]
         const passed = result.status === 'passed'
-        // Final status for each step
         const stepPassed = role === 'judge' ? passed : true
         store.setStepStatus(role, stepPassed ? 'done' : 'failed', ai)
       })
 
-      // Handle judge failure
       if (result.status === 'max_retries') {
         store.setStepStatus('judge', 'failed')
       }
@@ -54,31 +44,13 @@ export function useSolve() {
     [store]
   )
 
-  /**
-   * Simulates step-by-step animation while the pipeline is running.
-   * Since the backend is synchronous, we show estimated timing.
-   */
-  const startProgressAnimation = useCallback(() => {
-    const delays = [0, 8000, 18000, 28000, 38000]
-    const timers: ReturnType<typeof setTimeout>[] = []
-
-    AGENT_ORDER.forEach((role, i) => {
-      const t = setTimeout(() => {
-        if (useSolveStore.getState().solving) {
-          // Mark previous steps done
-          AGENT_ORDER.slice(0, i).forEach((r) => {
-            if (useSolveStore.getState().pipelineSteps.find((s) => s.role === r)?.status === 'active') {
-              useSolveStore.getState().setStepStatus(r, 'done')
-            }
-          })
-          useSolveStore.getState().setStepStatus(role, 'active')
-        }
-      }, delays[i])
-      timers.push(t)
+  const applyLiveEvents = useCallback((events: Array<{ agent: AgentRole; status: string }>) => {
+    events.forEach(({ agent, status }) => {
+      if (status === 'started') store.setStepStatus(agent, 'active')
+      else if (status === 'done' || status === 'unverified') store.setStepStatus(agent, 'done')
+      else if (status === 'failed') store.setStepStatus(agent, 'failed')
     })
-
-    return () => timers.forEach(clearTimeout)
-  }, [])
+  }, [store])
 
   const solve = useCallback(async () => {
     const { problem, language, imageFile, aiMode, manualOverrides, solving } = store
@@ -92,8 +64,6 @@ export function useSolve() {
     store.setSolving(true)
     store.resetPipeline()
 
-    const cancelAnimation = startProgressAnimation()
-
     try {
       let result: SolveResult
 
@@ -102,12 +72,36 @@ export function useSolve() {
         : null
 
       if (imageFile) {
+        store.setStepStatus('analyzer', 'active')
         result = await api.solveImage(imageFile, language, problem, overrides)
       } else {
-        result = await api.solveText(problem, language, overrides)
+        const { job_id: jobId, max_seconds: maxSeconds } = await api.startSolveJob(problem, language, overrides)
+        const deadline = Date.now() + (maxSeconds ?? 900) * 1000
+        while (true) {
+          if (Date.now() >= deadline) throw new Error('Solving timed out. Please run it again.')
+          await new Promise((resolve) => setTimeout(resolve, 350))
+          const job = await api.getSolveJob(jobId)
+          applyLiveEvents(job.events)
+          if (job.status === 'complete' && job.result) {
+            result = job.result
+            break
+          }
+          if (job.status === 'failed') {
+            if (job.error?.type === 'rate_limit') {
+              throw {
+                type: 'rate_limit',
+                ai: job.error.ai,
+                ai_label: job.error.ai_label,
+                message: job.error.message,
+                retryAfter: job.error.retry_after ? String(job.error.retry_after) : undefined,
+              }
+            }
+            throw new Error((job.error?.message ?? 'Solve failed.') +
+              (job.error?.request_id ? ` (Request ID: ${job.error.request_id})` : ''))
+          }
+        }
       }
 
-      cancelAnimation()
       applyPipelineEvents(result)
       store.setResult(result)
 
@@ -117,17 +111,19 @@ export function useSolve() {
         toast('Best attempt shown — could not pass all tests.', { icon: '⚠️' })
       }
 
-      // Refresh usage stats
       api.getUsage().then(store.setUsage).catch(() => {})
 
     } catch (err: unknown) {
-      cancelAnimation()
-
-      // Rate limit error (structured object from interceptor)
       if (isRateLimitError(err)) {
-        store.setRateLimitInfo({ ai: err.ai, ai_label: err.ai_label, message: err.message })
+        const aiLabel = err.ai_label ?? 'SolveX'
+        store.setRateLimitInfo({
+          ai: err.ai ?? 'system',
+          ai_label: aiLabel,
+          message: err.message ?? 'Rate limit reached.',
+          retryAfterSeconds: err.retryAfter ? Number(err.retryAfter) : undefined,
+        })
         AGENT_ORDER.forEach((r) => store.setStepStatus(r, 'failed'))
-        toast.error(`${err.ai_label} rate limit hit. Switch AI or wait for reset.`)
+        toast.error(`${aiLabel} rate limit hit. Switch AI or wait for reset.`)
       } else {
         const message = err instanceof Error ? err.message : 'Unexpected error'
         store.setError(message)
@@ -137,7 +133,7 @@ export function useSolve() {
     } finally {
       store.setSolving(false)
     }
-  }, [store, startProgressAnimation, applyPipelineEvents])
+  }, [store, applyPipelineEvents, applyLiveEvents])
 
   return { solve }
 }
