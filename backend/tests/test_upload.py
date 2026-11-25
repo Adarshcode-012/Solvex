@@ -1,13 +1,10 @@
 import io
-import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from PIL import Image
 from fastapi.testclient import TestClient
-
-os.environ.setdefault("OPENAI_API_KEY", "fake-key-for-tests-0123456789")
 
 from main import app
 
