@@ -1,9 +1,13 @@
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
 import secrets
 import uuid
+import ipaddress
+import platform
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from contextlib import asynccontextmanager
 
@@ -13,13 +17,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from typing import Optional
 
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 
-# Config is imported first — fails fast if no AI keys configured
-from config import settings
+from config import settings, _configured_worker_count
 from logger import log
+from utils import job_store
 from orchestrator import solve_problem
 from utils.ai_router import (
     get_usage_stats,
@@ -28,6 +31,8 @@ from utils.ai_router import (
     RateLimitHit,
     call_ai,
     AIProviderError,
+    ai_request_scope,
+    ai_progress_scope,
 )
 from agents.all_agents import AgentFailure
 from memory.brain import (
@@ -50,10 +55,96 @@ from memory.brain import (
 )
 
 
-# ── Login-free guest identity ─────────────────────────────────────────────────
 SESSION_COOKIE = "solvex_guest"
 CSRF_COOKIE = "solvex_csrf"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_redis_client = None
+_solve_jobs: dict[str, dict] = {}
+_WINDOW_INCR_SCRIPT = "local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],ARGV[1]) end; return {n,redis.call('TTL',KEYS[1])}"
+_DAILY_INCR_SCRIPT = "local n=redis.call('INCR',KEYS[1]); local ttl=redis.call('TTL',KEYS[1]); if n==1 or ttl<0 then redis.call('EXPIREAT',KEYS[1],ARGV[1]); ttl=redis.call('TTL',KEYS[1]); end; return {n,ttl}"
+
+
+def _trusted_proxy_networks():
+    return tuple(ipaddress.ip_network(item.strip(), strict=False) for item in settings.trusted_proxies.split(",") if item.strip())
+
+
+def _is_trusted_ip(value: str, networks=None) -> bool:
+    networks = _trusted_proxy_networks() if networks is None else networks
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    return any(address.version == network.version and address in network for network in networks)
+
+
+def get_client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    networks = _trusted_proxy_networks()
+    if not _is_trusted_ip(peer, networks):
+        return peer
+    for forwarded in reversed(request.headers.get("x-forwarded-for", "").split(",")):
+        candidate = forwarded.strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not _is_trusted_ip(candidate, networks):
+            return candidate
+    return peer
+
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None and settings.rate_limit_storage_uri != "memory://":
+        import redis
+        _redis_client = redis.Redis.from_url(settings.rate_limit_storage_uri, decode_responses=True)
+    return _redis_client
+
+
+def _redis_window_hit(key: str, seconds: int) -> tuple[int, int]:
+    client = _get_redis()
+    if client is None:
+        raise RuntimeError("Redis rate-limit storage is not configured")
+    count, ttl = client.eval(_WINDOW_INCR_SCRIPT, 1, key, seconds)
+    return int(count), max(1, int(ttl))
+
+
+def _new_guest_allowed(request: Request):
+    if getattr(request.state, "rate_limit_allow", False):
+        return
+    try:
+        count, ttl = _redis_window_hit(f"solvex:new-guest:{get_client_ip(request)}", 3600)
+    except Exception as exc:
+        if settings.app_env == "production":
+            log.error("rate_limit_redis_unavailable", path=request.url.path, error=str(exc))
+            raise HTTPException(503, "Rate limiting is temporarily unavailable.")
+        log.warning("RATE LIMIT WARNING: Redis unavailable; allowing guest creation in development", error=str(exc))
+        request.state.rate_limit_allow = True
+        return
+    if count > settings.new_guests_per_ip_per_hour:
+        raise HTTPException(429, "Guest session limit reached for this IP.", headers={"Retry-After": str(ttl)})
+
+
+def _consume_global_solve_cap(request: Request):
+    if getattr(request.state, "rate_limit_allow", False):
+        return
+    try:
+        client = _get_redis()
+        if client is None:
+            raise RuntimeError("Redis rate-limit storage is not configured")
+        now = datetime.now(timezone.utc)
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        day = now.strftime("%Y-%m-%d")
+        count, ttl = client.eval(_DAILY_INCR_SCRIPT, 1, f"solvex:global-solves:{day}", int(tomorrow.timestamp()))
+    except Exception as exc:
+        if settings.app_env == "production":
+            log.error("rate_limit_redis_unavailable", path=request.url.path, error=str(exc))
+            raise HTTPException(503, "Rate limiting is temporarily unavailable.")
+        log.warning("RATE LIMIT WARNING: Redis unavailable; allowing solve in development", error=str(exc))
+        request.state.rate_limit_allow = True
+        return
+    if int(count) > settings.global_daily_solve_cap:
+        raise HTTPException(429, {"error": "rate_limit", "message": "The global daily solve limit has been reached."}, headers={"Retry-After": str(max(1, int(ttl)))})
 
 
 def _session_secret() -> bytes:
@@ -82,6 +173,7 @@ async def get_current_user(request: Request, response: Response) -> str:
     guest_id = _verify_guest_cookie(request.cookies.get(SESSION_COOKIE))
     new_session = guest_id is None
     if new_session:
+        _new_guest_allowed(request)
         guest_id = f"guest_{secrets.token_urlsafe(24)}"
         csrf_token = secrets.token_urlsafe(32)
         response.set_cookie(SESSION_COOKIE, _sign_guest_id(guest_id), httponly=True, samesite="lax", secure=settings.app_env == "production")
@@ -96,28 +188,37 @@ async def get_current_user(request: Request, response: Response) -> str:
 verify_api_key = get_current_user
 
 
-# ── Rate limiter (protects the expensive /solve* endpoints from abuse) ────────
 def get_rate_limit_key(request: Request) -> str:
-    return _verify_guest_cookie(request.cookies.get(SESSION_COOKIE)) or get_remote_address(request)
+    return "" if getattr(request.state, "rate_limit_allow", False) else get_client_ip(request)
+
+
+def get_guest_rate_limit_key(request: Request) -> str:
+    return "" if getattr(request.state, "rate_limit_allow", False) else (_verify_guest_cookie(request.cookies.get(SESSION_COOKIE)) or "")
 
 
 limiter = Limiter(
     key_func=get_rate_limit_key,
     storage_uri=settings.rate_limit_storage_uri,
+    headers_enabled=True,
+    in_memory_fallback=["1000000000/minute"] if settings.app_env != "production" else [],
+    in_memory_fallback_enabled=settings.app_env != "production",
 )
 
 
-# ── Lifespan (startup/shutdown logging) ───────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("solvex_startup", env=settings.app_env, log_level=settings.log_level)
-    available = settings.available_keys
-    configured = [k for k, v in available.items() if v]
+    if settings.app_env != "production":
+        log.warning("Development mode: rate limits fail open if Redis is down; CORS may be permissive.")
+    key_statuses = settings.provider_key_statuses
+    for provider, status in key_statuses.items():
+        log.info("ai_provider_key_status", provider=provider, status=status)
+    configured = [provider for provider, status in key_statuses.items() if status == "configured"]
     log.info("ai_keys_loaded", configured=configured)
-    if not settings.app_secret_key:
-        log.warning(
-            "app_secret_key_unset",
-            msg="APP_SECRET_KEY not set — endpoints are UNPROTECTED. Fine for local dev only."
+    if not configured:
+        log.error(
+            "no_ai_provider_key_configured",
+            msg="No valid AI provider key is configured. Health checks remain available; solve requests will return 503.",
         )
     if settings.app_env == "production" and settings.redis_url:
         import redis
@@ -134,12 +235,58 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exception_handler(request: Request, exc: RateLimitExceeded):
+    response = JSONResponse(status_code=429, content={"detail": {"error": "rate_limit", "message": "Rate limit exceeded."}})
+    limiter._inject_headers(response, getattr(request.state, "view_rate_limit", None))
+    if "Retry-After" not in response.headers:
+        response.headers["Retry-After"] = "60"
+    return response
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-# allow_credentials is False because the app uses header-based auth (X-API-Key),
-# not cookies — enabling credentials with a broad origin list serves no purpose
-# and only weakens the CORS policy.
+
+@app.middleware("http")
+async def require_redis_for_protected_endpoints(request: Request, call_next):
+    if request.url.path in {"/health/detailed", "/usage/reset"}:
+        if not settings.admin_token:
+            return await call_next(request)
+        try:
+            count, ttl = _redis_window_hit(
+                f"solvex:admin:{get_client_ip(request)}", 60
+            )
+        except Exception as exc:
+            if settings.app_env == "production":
+                log.error("admin_rate_limit_redis_unavailable", path=request.url.path, error=str(exc))
+                return JSONResponse(status_code=503, content={"detail": "Admin rate limiting is temporarily unavailable."})
+            log.warning("ADMIN RATE LIMIT WARNING: Redis unavailable; allowing request in development", path=request.url.path, error=str(exc))
+        else:
+            if count > 10:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Admin request limit exceeded."},
+                    headers={"Retry-After": str(ttl)},
+                )
+    if request.url.path not in {"/solve", "/solve-image", "/explain"}:
+        return await call_next(request)
+    try:
+        client = _get_redis()
+        if client is None:
+            raise RuntimeError("Redis rate-limit storage is not configured")
+        client.ping()
+    except Exception as exc:
+        if request.url.path == "/explain":
+            if settings.app_env == "production":
+                log.error("explain_cache_redis_unavailable", error=str(exc))
+            else:
+                log.warning("explain_cache_redis_unavailable", error=str(exc))
+            request.state.rate_limit_allow = True
+        elif settings.app_env == "production":
+            log.error("rate_limit_redis_unavailable", path=request.url.path, error=str(exc))
+            return JSONResponse(status_code=503, content={"detail": "Rate limiting is temporarily unavailable."})
+        else:
+            log.warning("RATE LIMIT WARNING: Redis unavailable; allowing protected endpoint in development", path=request.url.path, error=str(exc))
+            request.state.rate_limit_allow = True
+    return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -149,10 +296,6 @@ app.add_middleware(
 )
 
 
-# ── Security headers ───────────────────────────────────────────────────────────
-# Belt-and-suspenders: most deployments will also get these from a reverse
-# proxy / platform edge (Railway, Render, nginx, etc), but setting them here
-# means the API is self-protecting even served directly.
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     request_id = str(uuid.uuid4())
@@ -167,7 +310,6 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# ── Global exception handler ──────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
@@ -180,6 +322,15 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
+    if (
+        isinstance(exc.detail, dict)
+        and exc.detail.get("code") in {"ai_key_missing", "ai_auth_failed", "ai_provider_timeout"}
+    ):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers,
+        )
     if exc.status_code < 500:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
@@ -191,11 +342,17 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
 class SolveRequest(BaseModel):
     problem:             str
     language:            str = "python"
     manual_ai_overrides: Optional[dict] = None
+
+    @field_validator("problem")
+    @classmethod
+    def validate_problem(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("problem must not be empty")
+        return v
 
     @field_validator("language")
     @classmethod
@@ -228,12 +385,28 @@ class ExplainRequest(BaseModel):
         return v
 
 
-_EXPLANATION_CACHE: dict[tuple[str, str], str] = {}
+def _explanation_cache_key(user_id: str, req: ExplainRequest) -> str:
+    material = f"{req.final_code}\0{req.language}\0{req.problem}".encode("utf-8")
+    digest = hashlib.sha256(material).hexdigest()
+    return f"explain:{user_id}:{digest}"
 
 
-def _explanation_cache_key(user_id: str, req: ExplainRequest) -> tuple[str, str]:
-    material = f"{req.language}\0{req.problem}\0{req.final_code}".encode("utf-8")
-    return user_id, hashlib.sha256(material).hexdigest()
+def _get_cached_explanation(key: str) -> Optional[str]:
+    try:
+        client = _get_redis()
+        return client.get(key) if client is not None else None
+    except Exception as exc:
+        log.warning("explain_cache_read_failed", error=str(exc))
+        return None
+
+
+def _cache_explanation(key: str, explanation: str) -> None:
+    try:
+        client = _get_redis()
+        if client is not None:
+            client.setex(key, settings.explain_cache_ttl_seconds, explanation)
+    except Exception as exc:
+        log.warning("explain_cache_write_failed", error=str(exc))
 
     @field_validator("problem")
     @classmethod
@@ -245,8 +418,12 @@ def _explanation_cache_key(user_id: str, req: ExplainRequest) -> tuple[str, str]
         return v
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def _handle_rate_limit(e: RateLimitHit):
+    headers = (
+        {"Retry-After": str(e.retry_after_seconds)}
+        if e.retry_after_seconds is not None
+        else None
+    )
     error = HTTPException(
         status_code=429,
         detail={
@@ -256,60 +433,132 @@ def _handle_rate_limit(e: RateLimitHit):
             "message":  str(e),
         }
     )
-    error.headers = {"Retry-After": "60"}
+    error.headers = headers
     raise error
+
+
+async def _execute_solve_job(job_id: str, problem: str, language: str, overrides: Optional[dict], user_id: str) -> None:
+    job = _solve_jobs.get(job_id)
+    if job is None:
+        return
+
+    def record_event(event: dict) -> None:
+        job["events"].append(event)
+        job_store.save(job_id, job)
+
+    try:
+        with ai_request_scope() as timings, ai_progress_scope(record_event):
+            result = await asyncio.wait_for(solve_problem(
+                problem=problem,
+                language=language,
+                manual_ai_overrides=overrides,
+                user_id=user_id,
+            ), timeout=settings.job_max_seconds)
+        result["timings"] = timings
+        job["result"] = result
+        job["status"] = "complete"
+    except asyncio.TimeoutError:
+        job["error"] = {"code": "job_timeout", "message": "Solving timed out. Please run it again."}
+        job["status"] = "failed"
+    except RateLimitHit as exc:
+        job["error"] = {
+            "type": "rate_limit", "ai": exc.ai_key, "ai_label": exc.ai_label,
+            "message": str(exc), "retry_after": exc.retry_after_seconds,
+        }
+        job["status"] = "failed"
+    except AgentFailure as exc:
+        job["error"] = {"code": exc.code or "agent_failed", "message": exc.reason}
+        job["status"] = "failed"
+    except Exception:
+        log.exception("solve_job_failed", job_id=job_id, request_id=job["request_id"])
+        job["error"] = {"code": "solve_failed", "message": "Solve failed. Check the backend log."}
+        job["status"] = "failed"
+
+    if job["error"] is not None:
+        job["error"]["request_id"] = job["request_id"]
+    job_store.save(job_id, job)
 
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    """
-    Public liveness check — no auth required, no secrets returned.
-    Load balancers / uptime monitors can hit this freely.
-    """
     return {"status": "ok"}
 
 
+async def require_admin_token(request: Request) -> None:
+    token = settings.admin_token
+    if token is None:
+        raise HTTPException(status_code=404, detail="Not found.")
+    supplied = request.headers.get("X-Admin-Token", "")
+    if not secrets.compare_digest(supplied, token):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+
 @app.get("/health/detailed")
-async def health_detailed(user_id: str = Depends(get_current_user)):
-    """
-    Returns server health + which AI keys are configured.
-    Protected: which providers are wired up is not something to expose publicly.
-    """
-    raise HTTPException(status_code=403, detail="Admin access required.")
+async def health_detailed(_admin: None = Depends(require_admin_token)):
+    redis_reachable = False
+    try:
+        client = _get_redis()
+        if client is not None:
+            client.ping()
+            redis_reachable = True
+    except Exception:
+        redis_reachable = False
+    return {
+        "memory_backend": settings.memory_backend,
+        "redis_reachable": redis_reachable,
+        "judge0_configured": bool(settings.judge0_api_key),
+        "python_version": platform.python_version(),
+        "app_version": app.version,
+        "worker_count": _configured_worker_count(),
+    }
 
 
 @app.post("/solve")
-@limiter.limit(settings.solve_rate_limit)
-async def solve_text(request: Request, req: SolveRequest, user_id: str = Depends(get_current_user)):
-    """
-    Main solve endpoint — text problem in, verified solution out.
-    Takes 30-90 seconds (5 agent calls + up to 5 Judge iterations).
-    Protected + rate-limited: each call can be 10-25 paid AI calls.
-    """
+@limiter.limit(settings.guest_solve_rate_limit, key_func=get_guest_rate_limit_key)
+@limiter.limit(settings.ip_solve_daily_rate_limit, key_func=get_rate_limit_key)
+@limiter.limit(settings.ip_solve_rate_limit, key_func=get_rate_limit_key)
+async def solve_text(request: Request, response: Response, req: SolveRequest, user_id: str = Depends(get_current_user)):
+    if not any(settings.available_keys.values()):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ai_key_missing",
+                "message": "No AI provider key is configured. Add one to backend/.env and restart.",
+            },
+        )
+
     log.info("solve_request", language=req.language,
              problem_len=len(req.problem), mode="text")
+    _consume_global_solve_cap(request)
     try:
-        result = await solve_problem(
-            problem=req.problem,
-            language=req.language,
-            image_base64=None,
-            manual_ai_overrides=req.manual_ai_overrides,
-            user_id=user_id,
-        )
+        with ai_request_scope() as timings:
+            result = await solve_problem(
+                problem=req.problem,
+                language=req.language,
+                image_base64=None,
+                manual_ai_overrides=req.manual_ai_overrides,
+                user_id=user_id,
+            )
+        result["timings"] = timings
         return result
     except RateLimitHit as e:
         _handle_rate_limit(e)
     except AgentFailure as e:
-        # An AI provider call failed (bad/expired key, empty response, etc) —
-        # this used to be silently swallowed and reported as a fake "passed"
-        # result. Now it's a real error: 502 because the failure is in an
-        # upstream AI provider, not in SolveX itself.
         log.error("solve_agent_failure", agent=e.agent, reason=e.reason)
+        if e.code == "ai_auth_failed":
+            raise HTTPException(
+                status_code=502,
+                detail={"code": e.code, "message": e.reason},
+            )
+        if e.code == "ai_provider_timeout":
+            raise HTTPException(
+                status_code=504,
+                detail={"code": e.code, "message": e.reason},
+            )
         raise HTTPException(status_code=502, detail="AI provider failure.")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -318,14 +567,72 @@ async def solve_text(request: Request, req: SolveRequest, user_id: str = Depends
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.post("/solve/jobs", status_code=202)
+@limiter.limit(settings.guest_solve_rate_limit, key_func=get_guest_rate_limit_key)
+@limiter.limit(settings.ip_solve_daily_rate_limit, key_func=get_rate_limit_key)
+@limiter.limit(settings.ip_solve_rate_limit, key_func=get_rate_limit_key)
+async def start_solve_job(request: Request, req: SolveRequest, user_id: str = Depends(get_current_user)):
+    if not settings.solvex_mock_ai and not any(settings.available_keys.values()):
+        raise HTTPException(status_code=503, detail={"code": "ai_key_missing", "message": "No AI provider key is configured."})
+    _consume_global_solve_cap(request)
+    job_id = uuid.uuid4().hex
+    if len(_solve_jobs) >= 100:
+        for old_id in list(_solve_jobs):
+            if _solve_jobs[old_id]["status"] != "running":
+                del _solve_jobs[old_id]
+                if len(_solve_jobs) < 90:
+                    break
+    if len(_solve_jobs) >= 100:
+        raise HTTPException(status_code=503, detail="The local solve queue is full. Try again shortly.")
+    _solve_jobs[job_id] = {
+        "request_id": request.state.request_id,
+        "user_id": user_id,
+        "status": "running",
+        "events": [],
+        "result": None,
+        "error": None,
+    }
+    job_store.save(job_id, _solve_jobs[job_id])
+    asyncio.create_task(_execute_solve_job(
+        job_id, req.problem, req.language, req.manual_ai_overrides, user_id,
+    ))
+    return {"job_id": job_id, "status": "running", "max_seconds": settings.job_max_seconds}
+
+
+@app.get("/solve/jobs/{job_id}")
+async def get_solve_job(job_id: str, user_id: str = Depends(get_current_user)):
+    job = _solve_jobs.get(job_id) or job_store.load(job_id)
+    if job is None or job["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail={
+            "code": "job_not_found",
+            "message": "The server restarted while solving. Please run it again.",
+        })
+    return {
+        "status": job["status"],
+        "events": list(job["events"]),
+        "result": job["result"],
+        "error": job["error"],
+    }
+
+
 @app.post("/explain")
-@limiter.limit(settings.solve_rate_limit)
+@limiter.limit(settings.guest_solve_rate_limit, key_func=get_guest_rate_limit_key)
+@limiter.limit(settings.ip_solve_daily_rate_limit, key_func=get_rate_limit_key)
+@limiter.limit(settings.ip_solve_rate_limit, key_func=get_rate_limit_key)
 async def explain_solution(
     request: Request,
+    response: Response,
     req: ExplainRequest,
     user_id: str = Depends(get_current_user),
 ):
-    """Explain an existing result with one Strategist call, without rebuilding the graph."""
+    if not any(settings.available_keys.values()):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ai_key_missing",
+                "message": "No AI provider key is configured. Add one to backend/.env and restart.",
+            },
+        )
     total_chars = sum(len(value) for value in (
         req.problem, req.final_code, req.chosen_approach, req.reasoning_chain,
     ))
@@ -333,13 +640,15 @@ async def explain_solution(
         raise HTTPException(status_code=422, detail="Explanation input too long (max 50,000 chars).")
 
     cache_key = _explanation_cache_key(user_id, req)
-    if cache_key in _EXPLANATION_CACHE:
-        return {"explanation": _EXPLANATION_CACHE[cache_key], "cached": True}
+    cached_explanation = _get_cached_explanation(cache_key)
+    if cached_explanation is not None:
+        return {"explanation": cached_explanation, "cached": True}
 
     try:
-        explanation, _ = await call_ai(
-            role="strategist",
-            messages=[
+        with ai_request_scope():
+            explanation, _ = await call_ai(
+                role="strategist",
+                messages=[
                 {
                     "role": "system",
                     "content": (
@@ -358,12 +667,16 @@ async def explain_solution(
                         f"Final code:\n{req.final_code}"
                     ),
                 },
-            ],
-        )
+                ],
+            )
     except RateLimitHit as e:
         _handle_rate_limit(e)
     except (AIProviderError, ValueError) as e:
         log.error("explain_ai_error", error=str(e))
+        if isinstance(e, AIProviderError) and e.code == "ai_auth_failed":
+            raise HTTPException(status_code=502, detail={"code": e.code, "message": str(e)})
+        if isinstance(e, AIProviderError) and e.code == "ai_provider_timeout":
+            raise HTTPException(status_code=504, detail={"code": e.code, "message": str(e)})
         raise HTTPException(status_code=502, detail="AI provider failure.")
     except Exception as e:
         log.error("explain_error", error=str(e))
@@ -371,30 +684,38 @@ async def explain_solution(
 
     if not explanation or not explanation.strip():
         raise HTTPException(status_code=502, detail="AI provider returned an empty explanation.")
-    _EXPLANATION_CACHE[cache_key] = explanation.strip()
-    return {"explanation": _EXPLANATION_CACHE[cache_key], "cached": False}
+    explanation = explanation.strip()
+    _cache_explanation(cache_key, explanation)
+    return {"explanation": explanation, "cached": False}
 
 
 @app.post("/solve-image")
-@limiter.limit(settings.solve_rate_limit)
+@limiter.limit(settings.guest_solve_rate_limit, key_func=get_guest_rate_limit_key)
+@limiter.limit(settings.ip_solve_daily_rate_limit, key_func=get_rate_limit_key)
+@limiter.limit(settings.ip_solve_rate_limit, key_func=get_rate_limit_key)
 async def solve_image(
     request:             Request,
+    response:            Response,
     image:               UploadFile = File(...),
     language:            str        = Form(default="python"),
     extra_text:          str        = Form(default=""),
     manual_ai_overrides: str        = Form(default="{}"),
     user_id: str                    = Depends(get_current_user),
 ):
-    """
-    Solve from a screenshot.
-    Claude Vision reads the problem directly from the image.
-    Protected + rate-limited, same reasoning as /solve.
-    """
     if language not in {"python", "cpp", "java"}:
         raise HTTPException(400, "language must be python, cpp, or java")
 
+    if not any(settings.available_keys.values()):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ai_key_missing",
+                "message": "No AI provider key is configured. Add one to backend/.env and restart.",
+            },
+        )
+
     image_bytes = await image.read()
-    if len(image_bytes) > 10 * 1024 * 1024:  # 10 MB limit
+    if len(image_bytes) > 10 * 1024 * 1024:
         raise HTTPException(413, "Image too large. Max 10MB.")
 
     try:
@@ -422,20 +743,33 @@ async def solve_image(
 
     log.info("solve_request", language=language, mode="image",
              image_size=len(image_bytes))
+    _consume_global_solve_cap(request)
     try:
-        result = await solve_problem(
-            problem=extra_text or "Solve the competitive programming problem in this image.",
-            language=language,
-            image_base64=image_base64,
-            manual_ai_overrides=overrides,
-            user_id=user_id,
-            image_mime_type=detected_type,
-        )
+        with ai_request_scope() as timings:
+            result = await solve_problem(
+                problem=extra_text or "Solve the competitive programming problem in this image.",
+                language=language,
+                image_base64=image_base64,
+                manual_ai_overrides=overrides,
+                user_id=user_id,
+                image_mime_type=detected_type,
+            )
+        result["timings"] = timings
         return result
     except RateLimitHit as e:
         _handle_rate_limit(e)
     except AgentFailure as e:
         log.error("solve_image_agent_failure", agent=e.agent, reason=e.reason)
+        if e.code == "ai_auth_failed":
+            raise HTTPException(
+                status_code=502,
+                detail={"code": e.code, "message": e.reason},
+            )
+        if e.code == "ai_provider_timeout":
+            raise HTTPException(
+                status_code=504,
+                detail={"code": e.code, "message": e.reason},
+            )
         raise HTTPException(status_code=502, detail="AI provider failure.")
     except Exception as e:
         log.error("solve_image_error", error=str(e))
@@ -444,34 +778,22 @@ async def solve_image(
 
 @app.get("/ai-config")
 async def ai_config(user_id: str = Depends(get_current_user)):
-    """
-    Returns which AI is assigned to each agent.
-    Frontend uses this to render the AI config panel.
-    """
     return get_ai_config_summary()
 
 
 @app.get("/usage")
 async def usage(user_id: str = Depends(get_current_user)):
-    """
-    Returns per-AI usage percentage for the progress bars.
-    Example: {"claude": {"percent": 82, "warning": true, "calls": 820}}
-    """
     return {**get_usage_stats(), "scope": "server"}
 
 
 @app.post("/usage/reset")
-async def usage_reset(user_id: str = Depends(get_current_user)):
-    """Resets all usage counters to zero."""
-    raise HTTPException(status_code=403, detail="Admin access required.")
+async def usage_reset(_admin: None = Depends(require_admin_token)):
+    reset_usage_stats()
+    return {"status": "reset"}
 
 
 @app.get("/brain/stats")
 async def brain_stats(user_id: str = Depends(get_current_user)):
-    """
-    Returns memory statistics for the Brain panel.
-    Shows problems solved, pass rate, patterns learned, recent solves.
-    """
     episodic = _load_json(_user_memory_file(user_id, "episodic.json"))
     semantic = _load_json(_user_memory_file(user_id, "semantic.json"))
     procedures = get_procedures(user_id)
@@ -509,13 +831,11 @@ async def brain_stats(user_id: str = Depends(get_current_user)):
 
 @app.get("/brain/temporal")
 async def brain_temporal(user_id: str = Depends(get_current_user)):
-    """Returns performance trends over time."""
     return get_temporal_insights(user_id)
 
 
 @app.get("/brain/procedures")
 async def brain_procedures(user_id: str = Depends(get_current_user)):
-    """Returns current learned procedures for each agent (what they've learned)."""
     procedures = get_procedures(user_id)
     return {
         "procedures":   procedures,
@@ -525,10 +845,6 @@ async def brain_procedures(user_id: str = Depends(get_current_user)):
 
 @app.post("/brain/reset")
 async def brain_reset(user_id: str = Depends(get_current_user)):
-    """
-    Wipes all memory — fresh start.
-    Use this if you want the brain to forget everything.
-    """
     deleted = reset_user_memory(user_id)
     deleted.update(reset_user_metadata(user_id))
     for path, key in [
@@ -543,13 +859,20 @@ async def brain_reset(user_id: str = Depends(get_current_user)):
     return {"message": "All memory cleared. Brain reset to defaults.", "deleted": deleted}
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+RELOAD_EXCLUDES = ["memory", "venv", "*.sqlite*", "*.db", "__pycache__"]
+RELOAD_INCLUDES = ["*.py", ".env"]
+
+
 if __name__ == "__main__":
     import uvicorn
+    import os
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=int(os.getenv("BACKEND_PORT", "8000")),
         reload=settings.app_env == "development",
+        reload_includes=RELOAD_INCLUDES,
+        reload_excludes=RELOAD_EXCLUDES,
         log_level=settings.log_level.lower(),
     )
