@@ -58,6 +58,10 @@ function Collapsible({
 export function OutputPanel() {
   const { result, error, rateLimitInfo, solving, language, problem, setExplanationText, setShowExplanation } = useSolveStore()
   const [explaining, setExplaining] = useState(false)
+  const aiErrorCode = error?.match(/^(ai_auth_failed|ai_key_missing|ai_provider_timeout):\s*/)?.[1]
+  const displayError = aiErrorCode
+    ? error!.replace(/^(ai_auth_failed|ai_key_missing|ai_provider_timeout):\s*/, '')
+    : error
 
   const requestExplanation = async () => {
     if (!problem.trim() || !result?.final_solution || explaining) return
@@ -80,7 +84,6 @@ export function OutputPanel() {
     }
   }
 
-  // ── Empty state ──────────────────────────────────────────────────────────────
   if (!solving && !result && !error && !rateLimitInfo) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4 text-dim">
@@ -94,7 +97,6 @@ export function OutputPanel() {
     )
   }
 
-  // ── Rate limit ───────────────────────────────────────────────────────────────
   if (rateLimitInfo) {
     return (
       <div className="p-4">
@@ -105,6 +107,9 @@ export function OutputPanel() {
           </div>
           <div className="p-4 space-y-2">
             <p className="text-sm text-yellow">{rateLimitInfo.message}</p>
+              {rateLimitInfo.retryAfterSeconds != null && Number.isFinite(rateLimitInfo.retryAfterSeconds) && (
+                <p className="text-[12px] text-mid">Try again in {rateLimitInfo.retryAfterSeconds} seconds.</p>
+              )}
             <p className="text-[12px] text-mid leading-relaxed">
               Go to <strong className="text-[#e2e4f0]">AI Config</strong> → Manual mode →
               switch <strong className="text-[#e2e4f0]">{rateLimitInfo.ai_label}</strong> to another AI,
@@ -116,20 +121,29 @@ export function OutputPanel() {
     )
   }
 
-  // ── Error ────────────────────────────────────────────────────────────────────
   if (error && !result) {
     return (
       <div className="p-4">
         <div className="card">
           <div className="card-header">
-            <div className="card-title">❌ Error</div>
-            <span className="badge badge-red">FAILED</span>
+            <div className="card-title">
+              {aiErrorCode === 'ai_auth_failed'
+                ? '⚠️ AI provider key rejected'
+                : aiErrorCode === 'ai_key_missing'
+                  ? '⚠️ No AI provider key configured'
+                  : aiErrorCode === 'ai_provider_timeout'
+                    ? '⏱️ AI request timed out'
+                  : '❌ Error'}
+            </div>
+            <span className="badge badge-red">{aiErrorCode ? 'ACTION REQUIRED' : 'FAILED'}</span>
           </div>
           <div className="p-4 space-y-2">
-            <p className="text-sm text-red">{error}</p>
-            <p className="text-[11px] text-mid">
-              Make sure the backend is running: <code className="font-mono bg-surface3 px-1.5 py-0.5 rounded">cd backend && python main.py</code>
-            </p>
+            <p className="text-sm text-red">{displayError}</p>
+            {error.startsWith('network_error:') && (
+              <p className="text-[11px] text-mid">
+                Make sure the backend is running: <code className="font-mono bg-surface3 px-1.5 py-0.5 rounded">powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1</code>
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -145,7 +159,6 @@ export function OutputPanel() {
   return (
     <div className="flex flex-col gap-3 p-4 overflow-y-auto h-full">
 
-      {/* ── Status + Complexity ─────────────────────────────────────────────── */}
       <div className="card">
         <div className="card-header">
           <div className="card-title">
@@ -180,7 +193,6 @@ export function OutputPanel() {
           </div>
         </div>
 
-        {/* AI used row */}
         {result.agents_ai_used && Object.keys(result.agents_ai_used).length > 0 && (
           <div className="px-4 pb-3 flex flex-wrap gap-2">
             {Object.entries(result.agents_ai_used).map(([role, ai]) => (
@@ -193,10 +205,19 @@ export function OutputPanel() {
             </span>
           </div>
         )}
+        {result.timings && result.timings.length > 0 && (
+          <div className="px-4 pb-3 flex flex-wrap items-center gap-2 text-[10px] font-mono text-mid">
+            <span className="font-bold uppercase tracking-wider text-dim">Time per agent</span>
+            {result.timings.map((timing, index) => (
+              <span key={`${timing.role}-${index}`}>
+                {timing.role}: {timing.seconds.toFixed(2)}s
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* ── Solution Code ───────────────────────────────────────────────────── */}
-      {result.final_solution && (
+      {result.final_solution ? (
         <div className="card">
           <div className="card-header">
             <div className="card-title">💻 {language.toUpperCase()} SOLUTION</div>
@@ -218,9 +239,10 @@ export function OutputPanel() {
             />
           </div>
         </div>
+      ) : (
+        <div className="card p-4 text-sm text-mid">No code was produced.</div>
       )}
 
-      {/* ── Reasoning chain ─────────────────────────────────────────────────── */}
       {result.reasoning_chain && (
         <Collapsible title="🧠 AGENT REASONING">
           <pre className="text-[12px] leading-relaxed text-mid whitespace-pre-wrap font-mono">
@@ -229,7 +251,6 @@ export function OutputPanel() {
         </Collapsible>
       )}
 
-      {/* ── Alternates ──────────────────────────────────────────────────────── */}
       {result.alternate_approaches?.length > 0 && (
         <Collapsible title="🔀 ALTERNATE APPROACHES">
           <div className="space-y-2">
@@ -248,7 +269,6 @@ export function OutputPanel() {
         </Collapsible>
       )}
 
-      {/* ── Error message ────────────────────────────────────────────────────── */}
       {result.error_message && (
         <div className="card">
           <div className="card-header">
