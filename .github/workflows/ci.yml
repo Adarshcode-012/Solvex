@@ -16,7 +16,7 @@ jobs:
       - run: pip install -r backend/requirements.txt pytest pytest-asyncio
       - run: pytest -q
       - run: pip install pip-audit
-      - run: pip-audit -r backend/requirements.txt
+      - run: python backend/scripts/audit_dependencies.py
 
   frontend:
     runs-on: ubuntu-latest
