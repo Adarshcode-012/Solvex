@@ -1,6 +1,6 @@
 import os
 
-os.environ.setdefault("OPENAI_API_KEY", "test-placeholder")
+os.environ.setdefault("OPENAI_API_KEY", "fake-key-for-tests-0123456789")
 
 from memory import brain
 
