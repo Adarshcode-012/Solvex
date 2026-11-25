@@ -12,9 +12,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // Proxy API calls to FastAPI during development
       '/api': {
-        target: 'http://localhost:8000',
+        target: `http://127.0.0.1:${process.env.DEV_API_PORT || 8000}`,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
