@@ -1,12 +1,3 @@
-"""
-memory/brain.py
-
-SolveX's 4-layer memory system: episodic (past attempts), semantic (learned
-patterns), procedural (per-agent learned heuristics), and temporal
-(performance trends over time). Episodic/semantic/procedural/temporal data
-persists to local JSON files with atomic writes; semantic recall is backed
-by a local ChromaDB collection.
-"""
 
 import os
 import json
@@ -27,7 +18,6 @@ from memory.metadata import (
     reset_user_metadata,
 )
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
 MEMORY_DIR      = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
@@ -49,7 +39,6 @@ def _user_memory_file(user_id: str, filename: str) -> str:
     os.makedirs(user_dir, exist_ok=True)
     return os.path.join(user_dir, filename)
 
-# ── ChromaDB (local vector DB) ────────────────────────────────────────────────
 CHROMA_AVAILABLE = False
 _episodic_col    = None
 _semantic_col    = None
@@ -60,10 +49,7 @@ try:
         raise ImportError("MEMORY_BACKEND=json")
     import chromadb
     from chromadb.config import Settings as ChromaSettings
-    # ChromaDB 0.5.x API. anonymized_telemetry=False: a backend service
-    # handling other people's DSA problems shouldn't phone home by default,
-    # and it also silences the noisy "Failed to send telemetry event"
-    # warnings that otherwise show up on every startup.
+    # keep telemetry off for local problem history
     _chroma_client = chromadb.PersistentClient(
         path=settings.chroma_db_path,
         settings=ChromaSettings(anonymized_telemetry=False),
@@ -91,7 +77,6 @@ def active_memory_backend() -> str:
 
 
 def reset_chroma_collections() -> dict[str, int]:
-    """Delete and recreate both vector collections, returning deleted counts."""
     global _episodic_col, _semantic_col
     if not CHROMA_AVAILABLE or _chroma_client is None:
         return {"episodic": 0, "semantic": 0}
@@ -125,7 +110,6 @@ def reset_user_memory(user_id: str) -> dict[str, int]:
     return deleted
 
 
-# ── Thread-safe JSON helpers ──────────────────────────────────────────────────
 def _load_json(path: str) -> dict:
     if os.path.exists(path):
         try:
@@ -137,7 +121,6 @@ def _load_json(path: str) -> dict:
 
 
 def _save_json(path: str, data: dict) -> None:
-    """Atomic write — write to temp file then rename to avoid corruption."""
     dir_name = os.path.dirname(path)
     try:
         with tempfile.NamedTemporaryFile(
@@ -146,14 +129,11 @@ def _save_json(path: str, data: dict) -> None:
         ) as tmp:
             json.dump(data, tmp, indent=2, ensure_ascii=False)
             tmp_path = tmp.name
-        os.replace(tmp_path, path)  # Atomic on POSIX, near-atomic on Windows
+        os.replace(tmp_path, path)
     except OSError as e:
         log.error("json_write_failed", path=path, error=str(e))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 1 — EPISODIC MEMORY
-# ══════════════════════════════════════════════════════════════════════════════
 
 def store_episodic(
     problem: str, approach: str, language: str,
@@ -181,7 +161,6 @@ def store_episodic(
         except Exception as e:
             log.warning("episodic_chroma_fail", error=str(e))
 
-    # JSON fallback
     data    = _load_json(_user_memory_file(user_id, "episodic.json"))
     entries = data.get("entries", [])
     entries.append(entry)
@@ -200,7 +179,6 @@ def recall_similar_problems(current_problem: str, user_id: str, top_k: int = 3) 
                 where={"user_id": user_id},
             )
             metas = results.get("metadatas", [[]])[0]
-            # Convert string booleans back
             for m in metas:
                 if "passed" in m and isinstance(m["passed"], str):
                     m["passed"] = m["passed"].lower() == "true"
@@ -208,7 +186,6 @@ def recall_similar_problems(current_problem: str, user_id: str, top_k: int = 3) 
         except Exception as e:
             log.warning("episodic_recall_fail", error=str(e))
 
-    # JSON fallback
     data          = _load_json(_user_memory_file(user_id, "episodic.json"))
     entries       = data.get("entries", [])
     current_words = set(current_problem.lower().split())
@@ -222,9 +199,6 @@ def recall_similar_problems(current_problem: str, user_id: str, top_k: int = 3) 
     return [e for _, e in scored[:top_k]]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 2 — SEMANTIC MEMORY
-# ══════════════════════════════════════════════════════════════════════════════
 
 def store_semantic(pattern: str, insight: str, category: str, user_id: str) -> None:
     entry = {
@@ -283,9 +257,6 @@ def recall_semantic_insights(query: str, user_id: str, top_k: int = 5) -> list[d
     return data.get("patterns", [])[:top_k]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 3 — PROCEDURAL MEMORY (self-improving agent instructions)
-# ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_PROCEDURES: dict[str, str] = {
     "analyzer": (
@@ -354,7 +325,6 @@ def update_procedure(agent_role: str, new_learning: str, user_id: str) -> None:
 
 
 def auto_learn_from_mistake(agent_role: str, mistake_type: str, user_id: str) -> None:
-    """Derives a procedural rule from a mistake type and stores it."""
     if not mistake_type:
         return
     for pattern, learning in LEARNING_MAP.items():
@@ -363,9 +333,6 @@ def auto_learn_from_mistake(agent_role: str, mistake_type: str, user_id: str) ->
             return
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 4 — TEMPORAL MEMORY
-# ══════════════════════════════════════════════════════════════════════════════
 
 def record_temporal_event(event_type: str, details: dict, user_id: str) -> None:
     record_sqlite_event(user_id, event_type, details)
@@ -388,7 +355,6 @@ def get_temporal_insights(user_id: str) -> dict:
     total       = len(solves)
     avg_iters   = sum(e.get("details", {}).get("iterations", 1) for e in solves) / total
 
-    # Per-category breakdown
     by_category: dict[str, dict] = {}
     for e in solves:
         cat = e.get("details", {}).get("category", "Unknown")
@@ -407,9 +373,6 @@ def get_temporal_insights(user_id: str) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE
-# ══════════════════════════════════════════════════════════════════════════════
 
 def create_session_state(
     problem: str,
@@ -427,36 +390,27 @@ def create_session_state(
         "image_base64":         image_base64,
         "image_mime_type":      image_mime_type,
         "manual_ai_overrides":  manual_ai_overrides or {},
-        # Analyzer
         "extracted_problem":    "",
         "constraints":          {},
         "dsa_category":         "",
         "sample_inputs":        [],
         "sample_outputs":       [],
-        # Strategist
         "chosen_approach":      "",
         "alternate_approaches": [],
         "time_complexity":      "",
         "space_complexity":     "",
         "reasoning_chain":      "",
-        # Coder
         "generated_code":       "",
-        # Reviewer
         "review_notes":         "",
-        # Judge loop
         "judge_iteration":      0,
         "judge_max_iterations": settings.judge_max_iterations,
         "judge_passed":         False,
         "judge_error":          "",
         "judge_wrong_output":   "",
         "compile_error":        "",
-        # True unless a Judge0 call was simulated (no JUDGE0_API_KEY set) — lets
-        # the frontend flag "passed" results that were never actually executed.
         "verified":             True,
-        # Meta
         "agents_ai_used":       {},
-        "pipeline_events":      [],   # SSE events for real-time progress
-        # Output
+        "pipeline_events":      [],
         "final_solution":       "",
         "status":               "pending",
         "error_message":        "",
