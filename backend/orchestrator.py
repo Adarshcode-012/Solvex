@@ -10,7 +10,6 @@ from memory.brain import create_session_state, store_episodic
 from logger import log
 
 
-# ── LangGraph state — must match create_session_state exactly ─────────────────
 class SolveXState(TypedDict):
     user_id:              str
     problem:              str
@@ -44,7 +43,6 @@ class SolveXState(TypedDict):
     error_message:        str
 
 
-# ── Node wrappers (async — agents make real network calls) ────────────────────
 async def _analyzer_node(state: SolveXState)   -> dict: return await run_analyzer(dict(state))
 async def _strategist_node(state: SolveXState) -> dict: return await run_strategist(dict(state))
 async def _coder_node(state: SolveXState)      -> dict: return await run_coder(dict(state))
@@ -61,7 +59,6 @@ def _should_continue(state: SolveXState) -> str:
 
 
 def _build_graph() -> StateGraph:
-    """Builds a fresh compiled graph for each request."""
     g = StateGraph(SolveXState)
     g.add_node("analyzer",   _analyzer_node)
     g.add_node("strategist", _strategist_node)
@@ -89,10 +86,6 @@ async def solve_problem(
     user_id: str = "guest_default",
     image_mime_type: Optional[str] = None,
 ) -> dict:
-    """
-    Runs the 5-agent pipeline and returns the full result dict.
-    Called by FastAPI endpoints.
-    """
     log.info("solve_start", language=language, has_image=bool(image_base64))
 
     initial = create_session_state(
@@ -107,7 +100,6 @@ async def solve_problem(
     graph = _build_graph()
     final = await graph.ainvoke(initial)
 
-    # Persist to episodic memory
     store_episodic(
         problem=final["extracted_problem"],
         approach=final["chosen_approach"],
