@@ -9,6 +9,8 @@ vi.mock('@/utils/api', () => ({
   api: {
     solveText: vi.fn(),
     solveImage: vi.fn(),
+    startSolveJob: vi.fn(),
+    getSolveJob: vi.fn(),
     getUsage: vi.fn().mockResolvedValue(null),
   },
 }))
@@ -23,7 +25,10 @@ describe('useSolve', () => {
   })
 
   it('handles a successful solve', async () => {
-    vi.mocked(api.solveText).mockResolvedValue(makeResult())
+    vi.mocked(api.startSolveJob).mockResolvedValue({ job_id: 'job-1' })
+    vi.mocked(api.getSolveJob)
+      .mockResolvedValueOnce({ status: 'running', events: [{ agent: 'analyzer', status: 'started' }], result: null, error: null })
+      .mockResolvedValueOnce({ status: 'complete', events: [{ agent: 'analyzer', status: 'done' }], result: makeResult(), error: null })
     const { result } = renderHook(() => useSolve())
 
     await act(async () => {
@@ -35,8 +40,10 @@ describe('useSolve', () => {
   })
 
   it('maps a structured rate-limit error', async () => {
-    vi.mocked(api.solveText).mockRejectedValue({
-      type: 'rate_limit', ai: 'claude', ai_label: 'Claude', message: 'Limit reached',
+    vi.mocked(api.startSolveJob).mockResolvedValue({ job_id: 'job-2' })
+    vi.mocked(api.getSolveJob).mockResolvedValue({
+      status: 'failed', events: [], result: null,
+      error: { type: 'rate_limit', ai: 'claude', ai_label: 'Claude', message: 'Limit reached' },
     })
     const { result } = renderHook(() => useSolve())
 
@@ -49,7 +56,11 @@ describe('useSolve', () => {
   })
 
   it('stores a generic error', async () => {
-    vi.mocked(api.solveText).mockRejectedValue(new Error('network failure'))
+    vi.mocked(api.startSolveJob).mockResolvedValue({ job_id: 'job-3' })
+    vi.mocked(api.getSolveJob).mockResolvedValue({
+      status: 'failed', events: [], result: null,
+      error: { code: 'solve_failed', message: 'network failure' },
+    })
     const { result } = renderHook(() => useSolve())
 
     await act(async () => {
